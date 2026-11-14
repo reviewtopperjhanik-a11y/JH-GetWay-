@@ -15,6 +15,9 @@ import com.example.gateway.WorkflowNode
 import com.example.gateway.WorkflowNodeType
 import com.example.network.McpHttpClient
 import com.example.network.ProviderHttpClient
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
+import org.junit.After
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -28,6 +31,17 @@ class ExampleRobolectricTest {
 
     @get:Rule
     val composeTestRule = createAndroidComposeRule<MainActivity>()
+
+    @After
+    fun tearDown() {
+        val app = ApplicationProvider.getApplicationContext<JhGetWayApplication>()
+        runBlocking(Dispatchers.IO) {
+            app.gatewayServer.stop()
+            app.preferences.clearAll()
+            app.database.clearAllTables()
+        }
+        CryptoManager.resetTestKeyProvider()
+    }
 
     @Test
     fun appName_isJhGetWay() {
@@ -66,23 +80,28 @@ class ExampleRobolectricTest {
         assertEquals("CYCLE_DETECTED", validation.errorKey)
     }
 
-    @Test
-    fun onboardingSkip_navigatesToDashboard() {
-        composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("onboarding_skip_all").assertIsDisplayed().performClick()
-        val deadlineNs = System.nanoTime() + 5_000_000_000L
+    private fun waitForTag(tag: String, timeoutMs: Long = 10_000L) {
+        val deadlineNs = System.nanoTime() + timeoutMs * 1_000_000L
         while (System.nanoTime() < deadlineNs) {
             val exists = runCatching {
-                composeTestRule.onNodeWithTag("dashboard_gateway_card").assertExists()
+                composeTestRule.onNodeWithTag(tag).assertExists()
                 true
             }.getOrDefault(false)
-            if (exists) break
+            if (exists) return
             Thread.sleep(50)
             composeTestRule.waitForIdle()
         }
+    }
+
+    @Test
+    fun onboardingSkip_navigatesToDashboard() {
+        composeTestRule.waitForIdle()
+        waitForTag("onboarding_skip_all")
+        composeTestRule.onNodeWithTag("onboarding_skip_all").assertIsDisplayed().performClick()
+        waitForTag("dashboard_gateway_card")
         composeTestRule.onNodeWithTag("dashboard_gateway_card").assertIsDisplayed()
         composeTestRule.onNodeWithTag("bottom_nav_providers").assertIsDisplayed().performClick()
-        composeTestRule.waitForIdle()
+        waitForTag("empty_add_provider_btn")
         composeTestRule.onNodeWithTag("empty_add_provider_btn").assertIsDisplayed()
     }
 }

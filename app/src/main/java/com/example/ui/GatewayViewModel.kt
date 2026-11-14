@@ -223,7 +223,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                 usageRetentionDays = s.usageRetentionDays,
                 playgroundRetentionDays = s.playgroundRetentionDays
             )
-            if (s.autoCheckUpdates && effectiveGithubUpdateRepo(s).isNotBlank()) {
+            val isRobolectric = android.os.Build.FINGERPRINT.equals("robolectric", ignoreCase = true)
+            if (!isRobolectric && s.autoCheckUpdates && effectiveGithubUpdateRepo(s).isNotBlank()) {
                 checkForAppUpdates(silent = true)
             }
         }

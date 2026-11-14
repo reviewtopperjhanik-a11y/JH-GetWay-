@@ -67,13 +67,25 @@ jobs:
 
       - name: Run core unit, Robolectric & updater tests
         timeout-minutes: 10
+        env:
+          GITHUB_REPOSITORY: ""
         run: |
-          TEST_ARGS="--tests com.example.ExampleUnitTest --tests com.example.ExampleRobolectricTest --tests com.example.AppUpdateManagerTest --tests com.example.RouterAndModelSelectionTest --console=plain --no-daemon"
+          TEST_ARGS="--tests com.example.ExampleUnitTest --tests com.example.ExampleRobolectricTest --tests com.example.AppUpdateManagerTest --tests com.example.RouterAndModelSelectionTest -PgithubRepo= --console=plain --no-daemon"
           if [ -x ./gradlew ]; then
             ./gradlew :app:testDebugUnitTest ${TEST_ARGS}
           else
             gradle :app:testDebugUnitTest ${TEST_ARGS}
           fi
+
+      - name: Upload unit test failure reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-failure-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/
+          retention-days: 7
 
   build-and-release:
     name: Build APK & Publish Release

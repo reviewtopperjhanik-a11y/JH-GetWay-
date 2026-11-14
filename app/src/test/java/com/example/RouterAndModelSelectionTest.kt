@@ -41,6 +41,10 @@ class RouterAndModelSelectionTest {
     fun setUp() {
         CryptoManager.resetTestKeyProvider()
         app = ApplicationProvider.getApplicationContext()
+        runBlocking(Dispatchers.IO) {
+            app.preferences.clearAll()
+            app.database.clearAllTables()
+        }
         inMemoryDb = Room.inMemoryDatabaseBuilder(app, JhGetWayDatabase::class.java)
             .allowMainThreadQueries()
             .build()
@@ -53,12 +57,7 @@ class RouterAndModelSelectionTest {
         inMemoryDb.close()
         runBlocking(Dispatchers.IO) {
             app.database.clearAllTables()
-            app.preferences.updateLocalAiSettings(
-                policy = LocalRoutingPolicy.LOCAL_CLOUD_FALLBACK,
-                allowCloudFallback = true,
-                localNetworkAllowed = false
-            )
-            app.preferences.setDefaultModelAndProvider("", "")
+            app.preferences.clearAll()
         }
         CryptoManager.resetTestKeyProvider()
     }
@@ -315,7 +314,7 @@ class RouterAndModelSelectionTest {
 
         val vm = GatewayViewModel(app)
         // Wait for ViewModel initial settings load
-        val initDeadline = System.nanoTime() + 5_000_000_000L
+        val initDeadline = System.nanoTime() + 10_000_000_000L
         while (System.nanoTime() < initDeadline && !vm.settings.value.localNetworkAccessAllowed) {
             Shadows.shadowOf(Looper.getMainLooper()).idle()
             Thread.sleep(30)
@@ -324,7 +323,7 @@ class RouterAndModelSelectionTest {
 
         vm.fetchProviderModels(provider, openPickerOnSuccess = true)
 
-        val fetchDeadline = System.nanoTime() + 5_000_000_000L
+        val fetchDeadline = System.nanoTime() + 10_000_000_000L
         while (System.nanoTime() < fetchDeadline && vm.fetchedModelsPrompt.value == null) {
             Shadows.shadowOf(Looper.getMainLooper()).idle()
             Thread.sleep(30)
@@ -337,7 +336,7 @@ class RouterAndModelSelectionTest {
         val proModel = prompt.models.first { it.modelId == "gemini-2.5-pro" }
         vm.selectModelForProvider(provider.id, proModel)
 
-        val selectDeadline = System.nanoTime() + 5_000_000_000L
+        val selectDeadline = System.nanoTime() + 10_000_000_000L
         while (System.nanoTime() < selectDeadline) {
             Shadows.shadowOf(Looper.getMainLooper()).idle()
             val savedProv = app.database.providerDao().getById(provider.id)

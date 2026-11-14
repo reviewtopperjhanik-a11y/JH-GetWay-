@@ -85,6 +85,16 @@ android {
   }
 }
 
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+  testLogging {
+    events("failed", "skipped")
+    exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    showExceptions = true
+    showCauses = true
+    showStackTraces = true
+  }
+}
+
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
 // to match the convention used in Web projects.
 secrets {
