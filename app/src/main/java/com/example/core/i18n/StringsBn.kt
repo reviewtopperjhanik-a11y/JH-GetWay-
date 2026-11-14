@@ -458,4 +458,13 @@ object BengaliStrings : AppStrings {
     override val installPermissionMessage = "ডাউনলোড করা APK আপডেটটি ইনস্টল করতে Android সেটিংসে JH GetWay-এর জন্য 'Install unknown apps' চালু করুন।"
     override val openSettingsLabel = "সেটিংস খুলুন"
     override val repoNotConfiguredMessage = "অটো আপডেট চালু করতে আপনার GitHub রিপোজিটরি (owner/repo) সেট করুন।"
+
+    override val fetchedModelsTitle = "প্রাপ্ত মডেল নির্বাচন করুন"
+    override val selectModelAction = "নির্বাচন"
+    override val activeModelBadge = "সক্রিয়"
+    override val notSelectedLabel = "নির্বাচিত নয়"
+    override val fetchingModelsLabel = "মডেল আনা হচ্ছে..."
+    override val noFetchedModelsMatch = "আপনার খোঁজার সাথে কোনো মডেল মেলেনি।"
+    override val customModelHint = "কাস্টম মডেল আইডি বা অ্যালিয়াস (ঐচ্ছিক)"
+    override val playgroundNoActiveProviderHint = "চ্যাট করতে API কী সহ একটি প্রোভাইডার যুক্ত বা চালু করুন।"
 }

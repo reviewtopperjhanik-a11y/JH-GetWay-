@@ -33,7 +33,9 @@ fun PlaygroundScreen(
     val s = LocalStrings.current
     val settings by viewModel.settings.collectAsState()
     val providers by viewModel.providers.collectAsState()
+    val localServers by viewModel.localServers.collectAsState()
     val models by viewModel.models.collectAsState()
+    val playgroundTarget by viewModel.playgroundTarget.collectAsState()
     val sessions by viewModel.playgroundSessions.collectAsState()
     val savedMessages by viewModel.activeSessionMessages.collectAsState()
     val ephemeralMessages by viewModel.ephemeralMessages.collectAsState()
@@ -47,13 +49,8 @@ fun PlaygroundScreen(
 
     var compareMode by remember { mutableStateOf(false) }
     var selectedProviderId by remember { mutableStateOf<String?>(null) }
-    var selectedModelId by remember(models, settings.defaultModelId) {
-        mutableStateOf(
-            settings.defaultModelId.ifBlank {
-                models.firstOrNull { it.isDefault }?.modelId ?: models.firstOrNull()?.modelId.orEmpty()
-            }
-        )
-    }
+    var selectedModelId by remember { mutableStateOf("") }
+    var customModelDialogVisible by remember { mutableStateOf(false) }
     var systemPrompt by remember { mutableStateOf("") }
     var promptInput by remember { mutableStateOf("") }
     var showParams by remember { mutableStateOf(false) }
@@ -65,7 +62,122 @@ fun PlaygroundScreen(
     var streamingEnabled by remember { mutableStateOf(true) }
     var jsonOutput by remember { mutableStateOf(false) }
 
-    val selectedModelEntity = models.firstOrNull { it.modelId == selectedModelId }
+    val enabledProviderIds = remember(providers, localServers) {
+        buildSet {
+            providers.filter { it.enabled }.forEach { add(it.id) }
+            localServers.filter { it.enabled }.forEach { add("local:${it.id}") }
+        }
+    }
+
+    val eligibleModels = remember(models, providers, localServers, selectedProviderId, enabledProviderIds) {
+        val dbFiltered = models.filter { m ->
+            m.enabled &&
+                m.providerId in enabledProviderIds &&
+                (selectedProviderId == null || m.providerId == selectedProviderId)
+        }.toMutableList()
+
+        // Ensure enabled providers/local servers with a defaultModel appear even before catalog fetch
+        if (selectedProviderId == null) {
+            providers.filter { it.enabled && it.defaultModel.isNotBlank() }.forEach { p ->
+                if (dbFiltered.none { it.providerId == p.id && it.modelId.equals(p.defaultModel, true) }) {
+                    dbFiltered += ModelEntity(
+                        id = "${p.id}::${p.defaultModel}",
+                        modelId = p.defaultModel,
+                        displayName = p.defaultModel,
+                        providerId = p.id,
+                        providerName = p.name,
+                        isLocal = false,
+                        isDefault = settings.defaultModelId.equals(p.defaultModel, true)
+                    )
+                }
+            }
+            localServers.filter { it.enabled && it.defaultModel.isNotBlank() }.forEach { srv ->
+                val lid = "local:${srv.id}"
+                if (dbFiltered.none { it.providerId == lid && it.modelId.equals(srv.defaultModel, true) }) {
+                    dbFiltered += ModelEntity(
+                        id = "$lid::${srv.defaultModel}",
+                        modelId = srv.defaultModel,
+                        displayName = srv.defaultModel,
+                        providerId = lid,
+                        providerName = srv.name,
+                        isLocal = true
+                    )
+                }
+            }
+        } else if (selectedProviderId!!.startsWith("local:")) {
+            val srv = localServers.firstOrNull { "local:${it.id}" == selectedProviderId && it.enabled }
+            if (srv != null && srv.defaultModel.isNotBlank() &&
+                dbFiltered.none { it.modelId.equals(srv.defaultModel, true) }
+            ) {
+                dbFiltered.add(
+                    0,
+                    ModelEntity(
+                        id = "${selectedProviderId}::${srv.defaultModel}",
+                        modelId = srv.defaultModel,
+                        displayName = srv.defaultModel,
+                        providerId = selectedProviderId!!,
+                        providerName = srv.name,
+                        isLocal = true
+                    )
+                )
+            }
+        } else {
+            val prov = providers.firstOrNull { it.id == selectedProviderId && it.enabled }
+            if (prov != null && prov.defaultModel.isNotBlank() &&
+                dbFiltered.none { it.modelId.equals(prov.defaultModel, true) }
+            ) {
+                dbFiltered.add(
+                    0,
+                    ModelEntity(
+                        id = "${prov.id}::${prov.defaultModel}",
+                        modelId = prov.defaultModel,
+                        displayName = prov.defaultModel,
+                        providerId = prov.id,
+                        providerName = prov.name,
+                        isLocal = false
+                    )
+                )
+            }
+        }
+        dbFiltered
+    }
+
+    LaunchedEffect(playgroundTarget) {
+        val target = playgroundTarget
+        if (target != null) {
+            selectedProviderId = target.providerId?.takeIf { it in enabledProviderIds }
+            selectedModelId = target.modelId
+            viewModel.consumePlaygroundTarget()
+        }
+    }
+
+    LaunchedEffect(selectedProviderId, eligibleModels, settings.defaultModelId) {
+        if (selectedProviderId != null && selectedProviderId !in enabledProviderIds) {
+            selectedProviderId = null
+        }
+        val currentIsEligible = selectedModelId.isNotBlank() && (
+            selectedProviderId == null ||
+                eligibleModels.any { it.modelId.equals(selectedModelId, ignoreCase = true) }
+            )
+        if (!currentIsEligible) {
+            selectedModelId = when {
+                selectedProviderId != null -> {
+                    val provDef = providers.firstOrNull { it.id == selectedProviderId }?.defaultModel.orEmpty()
+                    val srvDef = localServers.firstOrNull { "local:${it.id}" == selectedProviderId }?.defaultModel.orEmpty()
+                    provDef.ifBlank { srvDef }.ifBlank {
+                        eligibleModels.firstOrNull { it.isDefault }?.modelId
+                            ?: eligibleModels.firstOrNull()?.modelId.orEmpty()
+                    }
+                }
+                settings.defaultModelId.isNotBlank() -> settings.defaultModelId
+                else -> eligibleModels.firstOrNull { it.isDefault }?.modelId
+                    ?: eligibleModels.firstOrNull()?.modelId.orEmpty()
+            }
+        }
+    }
+
+    val selectedModelEntity = eligibleModels.firstOrNull { it.modelId == selectedModelId }
+        ?: models.firstOrNull { it.modelId == selectedModelId }
     var compareSelection by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -118,32 +230,66 @@ fun PlaygroundScreen(
                 FilterChip(
                     selected = selectedProviderId == null,
                     onClick = { selectedProviderId = null },
-                    label = { Text(s.autoRouterLabel) }
+                    label = { Text(s.autoRouterLabel) },
+                    modifier = Modifier.testTag("playground_provider_auto")
                 )
             }
-            items(providers.filter { it.enabled }) { p ->
+            items(providers.filter { it.enabled }, key = { it.id }) { p ->
                 FilterChip(
                     selected = selectedProviderId == p.id,
                     onClick = {
                         selectedProviderId = p.id
-                        if (p.defaultModel.isNotBlank()) selectedModelId = p.defaultModel
+                        val preferred = p.defaultModel.ifBlank {
+                            models.firstOrNull { it.providerId == p.id && it.enabled && it.isDefault }?.modelId
+                                ?: models.firstOrNull { it.providerId == p.id && it.enabled }?.modelId.orEmpty()
+                        }
+                        if (preferred.isNotBlank()) selectedModelId = preferred
                     },
-                    label = { Text(p.name) }
+                    label = { Text(p.name) },
+                    modifier = Modifier.testTag("playground_provider_${p.id}")
+                )
+            }
+            items(localServers.filter { it.enabled }, key = { "local:${it.id}" }) { srv ->
+                val lid = "local:${srv.id}"
+                FilterChip(
+                    selected = selectedProviderId == lid,
+                    onClick = {
+                        selectedProviderId = lid
+                        val preferred = srv.defaultModel.ifBlank {
+                            models.firstOrNull { it.providerId == lid && it.enabled }?.modelId.orEmpty()
+                        }
+                        if (preferred.isNotBlank()) selectedModelId = preferred
+                    },
+                    label = { Text("${srv.name} (${s.localModels})") },
+                    modifier = Modifier.testTag("playground_provider_$lid")
                 )
             }
         }
 
-        if (models.isNotEmpty() && !compareMode) {
+        if (!compareMode && (eligibleModels.isNotEmpty() || enabledProviderIds.isNotEmpty())) {
             LazyRow(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                items(models.filter { it.enabled }) { m ->
-                    val label = if (m.alias.isNotBlank()) "${m.alias} (${m.modelId})" else m.modelId
+                items(eligibleModels, key = { it.id }) { m ->
+                    val label = when {
+                        m.alias.isNotBlank() -> "${m.alias} (${m.modelId})"
+                        selectedProviderId == null -> "${m.providerName}: ${m.modelId}"
+                        else -> m.modelId
+                    }
                     FilterChip(
-                        selected = selectedModelId == m.modelId,
+                        selected = selectedModelId.equals(m.modelId, ignoreCase = true),
                         onClick = { selectedModelId = m.modelId },
-                        label = { Text(label, style = MonoTextStyle) }
+                        label = { Text(label, style = MonoTextStyle) },
+                        modifier = Modifier.testTag("playground_model_${m.modelId}")
+                    )
+                }
+                item {
+                    AssistChip(
+                        onClick = { customModelDialogVisible = true },
+                        label = { Text(if (selectedModelId.isBlank()) s.modelOrAliasLabel else "${s.edit}: $selectedModelId", style = MonoTextStyle) },
+                        leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                        modifier = Modifier.testTag("playground_custom_model_btn")
                     )
                 }
             }
@@ -184,12 +330,12 @@ fun PlaygroundScreen(
             }
         }
 
-        if (providers.isEmpty() && models.isEmpty()) {
+        if (providers.none { it.enabled } && localServers.none { it.enabled }) {
             Box(modifier = Modifier.weight(1f).padding(16.dp), contentAlignment = Alignment.Center) {
                 EmptyStatePanel(
                     icon = Icons.AutoMirrored.Filled.Chat,
                     title = s.noProvidersTitle,
-                    message = s.noProvidersMessage,
+                    message = s.playgroundNoActiveProviderHint,
                     actionLabel = s.addProvider,
                     onAction = { onNavigate(Routes.PROVIDERS) }
                 )
@@ -395,5 +541,32 @@ fun PlaygroundScreen(
                 }
             }
         }
+    }
+
+    if (customModelDialogVisible) {
+        var customInput by remember(selectedModelId) { mutableStateOf(selectedModelId) }
+        AlertDialog(
+            onDismissRequest = { customModelDialogVisible = false },
+            title = { Text(s.modelOrAliasLabel) },
+            text = {
+                OutlinedTextField(
+                    value = customInput,
+                    onValueChange = { customInput = it },
+                    label = { Text(s.customModelHint) },
+                    textStyle = MonoTextStyle,
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().testTag("playground_custom_model_input")
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    selectedModelId = customInput.trim()
+                    customModelDialogVisible = false
+                }) { Text(s.confirm) }
+            },
+            dismissButton = {
+                TextButton(onClick = { customModelDialogVisible = false }) { Text(s.cancel) }
+            }
+        )
     }
 }

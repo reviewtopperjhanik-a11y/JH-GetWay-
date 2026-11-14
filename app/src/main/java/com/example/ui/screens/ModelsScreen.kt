@@ -59,7 +59,7 @@ fun ModelsScreen(
             ) {
                 Text(s.modelsTitle, style = MaterialTheme.typography.headlineSmall)
                 if (providers.isNotEmpty()) {
-                    TextButton(onClick = { providers.forEach { viewModel.fetchProviderModels(it) } }) {
+                    TextButton(onClick = { providers.forEach { viewModel.fetchProviderModels(it, openPickerOnSuccess = false) } }) {
                         Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
                         Text(s.refresh)
@@ -132,10 +132,16 @@ fun ModelsScreen(
                             Text(s.setAlias)
                         }
                         if (!model.isDefault) {
-                            TextButton(onClick = { viewModel.setDefaultModel(model) }) { Text(s.setDefault) }
+                            TextButton(onClick = {
+                                if (model.isLocal) viewModel.setDefaultModel(model)
+                                else viewModel.selectModelForProvider(model.providerId, model)
+                            }) { Text(s.setDefault) }
                         }
                         TextButton(onClick = { detailTarget = model }) { Text(s.details) }
-                        TextButton(onClick = { onNavigate(Routes.PLAYGROUND) }) { Text(s.testModel) }
+                        TextButton(onClick = {
+                            viewModel.openModelInPlayground(model)
+                            onNavigate(Routes.PLAYGROUND)
+                        }) { Text(s.testModel) }
                         IconButton(onClick = { viewModel.toggleModelEnabled(model) }) {
                             Icon(
                                 imageVector = if (model.enabled) Icons.Default.ToggleOn else Icons.Default.ToggleOff,

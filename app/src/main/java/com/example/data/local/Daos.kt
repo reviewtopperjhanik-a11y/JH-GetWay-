@@ -304,6 +304,9 @@ interface PlaygroundDao {
     @Query("SELECT * FROM playground_messages WHERE sessionId = :sessionId ORDER BY timestamp ASC")
     fun observeMessages(sessionId: String): Flow<List<PlaygroundMessageEntity>>
 
+    @Query("SELECT * FROM playground_messages WHERE sessionId = :sessionId ORDER BY timestamp ASC")
+    suspend fun getMessagesOnce(sessionId: String): List<PlaygroundMessageEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMessage(message: PlaygroundMessageEntity)
 

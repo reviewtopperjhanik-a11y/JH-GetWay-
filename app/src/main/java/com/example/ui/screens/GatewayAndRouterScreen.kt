@@ -423,6 +423,37 @@ fun SmartRouterScreen(viewModel: GatewayViewModel) {
                         modifier = Modifier.weight(1f)
                     )
                 }
+                HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                Text(s.localRoutingPolicy, style = MaterialTheme.typography.titleSmall)
+                Spacer(Modifier.height(6.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    LocalRoutingPolicy.entries.forEach { policy ->
+                        FilterChip(
+                            selected = settings.localRoutingPolicy == policy,
+                            onClick = {
+                                val autoFallback = if (policy == LocalRoutingPolicy.LOCAL_CLOUD_FALLBACK) true else settings.allowCloudFallbackForLocal
+                                viewModel.updateLocalAiSettings(policy, autoFallback, settings.localNetworkAccessAllowed)
+                            },
+                            label = { Text(policy.name.replace("_", " ")) },
+                            modifier = Modifier.testTag("router_local_policy_${policy.name}")
+                        )
+                    }
+                }
+                if (settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_FIRST) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(s.allowCloudFallback, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                        Switch(
+                            checked = settings.allowCloudFallbackForLocal,
+                            onCheckedChange = {
+                                viewModel.updateLocalAiSettings(settings.localRoutingPolicy, it, settings.localNetworkAccessAllowed)
+                            }
+                        )
+                    }
+                }
             }
         }
 

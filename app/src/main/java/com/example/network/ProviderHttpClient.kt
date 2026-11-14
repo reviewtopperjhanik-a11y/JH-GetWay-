@@ -207,6 +207,9 @@ class ProviderHttpClient(
         if (!sec.allowed) {
             return@withContext Result.failure(IllegalArgumentException(sec.errorMessage ?: "Insecure URL blocked by HTTPS/Local policy"))
         }
+        if (apiKey.isBlank() && !NetworkAddressClassifier.isPrivateOrLoopbackHost(provider.baseUrl)) {
+            return@withContext Result.failure(IllegalStateException("No active API key configured for this provider."))
+        }
         val adapter = ProviderAdapterRegistry.adapterFor(provider.apiFormat)
         try {
             val url = adapter.buildModelsUrl(provider.baseUrl)

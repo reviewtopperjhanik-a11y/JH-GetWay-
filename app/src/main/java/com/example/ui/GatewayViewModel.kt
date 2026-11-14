@@ -73,6 +73,16 @@ data class AppUpdateUiState(
     val needsInstallPermission: Boolean = false
 )
 
+data class FetchedModelsPrompt(
+    val provider: ProviderEntity,
+    val models: List<ModelEntity>
+)
+
+data class PlaygroundTarget(
+    val providerId: String?,
+    val modelId: String
+)
+
 class GatewayViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as JhGetWayApplication
     private val db = app.database
@@ -181,6 +191,15 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
 
     private val _appUpdateUiState = MutableStateFlow(AppUpdateUiState())
     val appUpdateUiState: StateFlow<AppUpdateUiState> = _appUpdateUiState.asStateFlow()
+
+    private val _fetchingProviderIds = MutableStateFlow<Set<String>>(emptySet())
+    val fetchingProviderIds: StateFlow<Set<String>> = _fetchingProviderIds.asStateFlow()
+
+    private val _fetchedModelsPrompt = MutableStateFlow<FetchedModelsPrompt?>(null)
+    val fetchedModelsPrompt: StateFlow<FetchedModelsPrompt?> = _fetchedModelsPrompt.asStateFlow()
+
+    private val _playgroundTarget = MutableStateFlow<PlaygroundTarget?>(null)
+    val playgroundTarget: StateFlow<PlaygroundTarget?> = _playgroundTarget.asStateFlow()
 
     private val appLockManager = AppLockManager()
     private var streamingJob: Job? = null
@@ -298,7 +317,13 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         notes: String,
         initialApiKey: String
     ) = viewModelScope.launch {
-        val headersJson = buildHeadersJson(customHeadersText)
+        val existing = existingId?.let { db.providerDao().getById(it) }
+        val headersJson = if (customHeadersText.isBlank() && existing != null) {
+            existing.customHeadersJson
+        } else {
+            buildHeadersJson(customHeadersText)
+        }
+        val trimmedModel = defaultModel.trim()
         val provider = ProviderEntity(
             id = existingId ?: UUID.randomUUID().toString(),
             name = name.trim(),
@@ -306,33 +331,55 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             presetId = presetId,
             baseUrl = baseUrl.trim().trimEnd('/'),
             apiFormat = apiFormat,
-            defaultModel = defaultModel.trim(),
+            defaultModel = trimmedModel,
             priority = priority,
             enabled = enabled,
             customHeadersJson = headersJson,
-            notes = notes.trim()
+            notes = notes.trim(),
+            status = existing?.status ?: ProviderStatus.UNKNOWN,
+            lastLatencyMs = existing?.lastLatencyMs,
+            lastError = existing?.lastError,
+            lastCheckedAt = existing?.lastCheckedAt,
+            createdAt = existing?.createdAt ?: System.currentTimeMillis()
         )
         db.providerDao().upsert(provider)
         if (initialApiKey.isNotBlank()) {
             addApiKey(provider.id, "${provider.name} Primary Key", initialApiKey.trim(), 1, isDefault = true, KeySelectionPolicy.PRIORITY)
         }
-        if (defaultModel.isNotBlank()) {
+        if (trimmedModel.isNotBlank()) {
             val existingModels = db.modelDao().getByProvider(provider.id)
-            if (existingModels.none { it.modelId == defaultModel.trim() }) {
-                val pricing = ProviderPresets.lookupPricing(defaultModel.trim())
-                db.modelDao().upsert(
-                    ModelEntity(
-                        id = "${provider.id}::${defaultModel.trim()}",
-                        modelId = defaultModel.trim(),
-                        displayName = defaultModel.trim(),
-                        providerId = provider.id,
-                        providerName = provider.name,
-                        modelType = ProviderPresets.inferModelType(defaultModel.trim()),
-                        inputPricePer1M = pricing?.inputPer1M,
-                        outputPricePer1M = pricing?.outputPer1M,
-                        pricingUpdatedAt = pricing?.updatedAt
-                    )
+            val shouldSetGlobalDefault = settings.value.defaultModelId.isBlank()
+            val matched = existingModels.firstOrNull { it.modelId == trimmedModel }
+            if (matched == null) {
+                val pricing = ProviderPresets.lookupPricing(trimmedModel)
+                val entity = ModelEntity(
+                    id = "${provider.id}::$trimmedModel",
+                    modelId = trimmedModel,
+                    displayName = trimmedModel,
+                    providerId = provider.id,
+                    providerName = provider.name,
+                    modelType = ProviderPresets.inferModelType(trimmedModel),
+                    inputPricePer1M = pricing?.inputPer1M,
+                    outputPricePer1M = pricing?.outputPer1M,
+                    pricingUpdatedAt = pricing?.updatedAt,
+                    isDefault = shouldSetGlobalDefault,
+                    enabled = true
                 )
+                if (shouldSetGlobalDefault) {
+                    db.withTransaction {
+                        db.modelDao().clearDefaultFlag()
+                        db.modelDao().upsert(entity)
+                    }
+                    prefs.setDefaultModelAndProvider(trimmedModel, provider.id)
+                } else {
+                    db.modelDao().upsert(entity)
+                }
+            } else if (shouldSetGlobalDefault) {
+                db.withTransaction {
+                    db.modelDao().clearDefaultFlag()
+                    db.modelDao().upsert(matched.copy(isDefault = true, enabled = true))
+                }
+                prefs.setDefaultModelAndProvider(trimmedModel, provider.id)
             }
         }
         logEvent(ActivityCategory.PROVIDER_CONNECTION, provider.name, "SAVED", "Provider configuration saved")
@@ -397,34 +444,116 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         postBanner("${provider.name}: ${result.message}")
     }
 
-    fun fetchProviderModels(provider: ProviderEntity) = viewModelScope.launch {
-        val keys = db.apiKeyDao().getForProvider(provider.id).filter { it.enabled }
-        val activeKey = keys.firstOrNull { it.isDefault } ?: keys.firstOrNull()
-        val plainKey = if (activeKey != null) {
-            CryptoManager.decryptResult(activeKey.encryptedKey).getOrElse { err ->
-                val msg = MaskingUtils.sanitizeErrorMessage(err.message)
-                postBanner("${provider.name}: $msg")
-                logEvent(ActivityCategory.KEY_UPDATE, provider.name, "DECRYPT_FAILED", msg)
-                return@launch
-            }
-        } else ""
-        val result = httpClient.fetchProviderModels(provider, plainKey, settings.value.localNetworkAccessAllowed)
-        result.fold(
-            onSuccess = { fetched ->
-                val existing = db.modelDao().getByProvider(provider.id).associateBy { it.modelId }
-                val merged = fetched.map { m ->
-                    val prev = existing[m.modelId]
-                    if (prev != null) m.copy(alias = prev.alias, isDefault = prev.isDefault, enabled = prev.enabled) else m
+    fun fetchProviderModels(provider: ProviderEntity, openPickerOnSuccess: Boolean = true) = viewModelScope.launch {
+        _fetchingProviderIds.update { it + provider.id }
+        try {
+            val keys = db.apiKeyDao().getForProvider(provider.id).filter { it.enabled }
+            val activeKey = keys.firstOrNull { it.isDefault } ?: keys.firstOrNull()
+            val plainKey = if (activeKey != null) {
+                CryptoManager.decryptResult(activeKey.encryptedKey).getOrElse { err ->
+                    val msg = MaskingUtils.sanitizeErrorMessage(err.message)
+                    postBanner("${provider.name}: $msg")
+                    logEvent(ActivityCategory.KEY_UPDATE, provider.name, "DECRYPT_FAILED", msg)
+                    return@launch
                 }
-                db.modelDao().upsertAll(merged)
-                postBanner("${provider.name}: Fetched ${merged.size} models")
-                logEvent(ActivityCategory.PROVIDER_CONNECTION, provider.name, "MODELS_FETCHED", "Discovered ${merged.size} models")
-            },
-            onFailure = { err ->
-                postBanner("${provider.name}: ${err.message}")
-                logEvent(ActivityCategory.PROVIDER_ERROR, provider.name, "FETCH_FAILED", err.message ?: "Failed to fetch models")
-            }
+            } else ""
+            val result = httpClient.fetchProviderModels(provider, plainKey, settings.value.localNetworkAccessAllowed)
+            result.fold(
+                onSuccess = { fetched ->
+                    val existing = db.modelDao().getByProvider(provider.id).associateBy { it.modelId }
+                    val merged = fetched.map { m ->
+                        val prev = existing[m.modelId]
+                        if (prev != null) m.copy(alias = prev.alias, isDefault = prev.isDefault, enabled = prev.enabled) else m
+                    }
+                    db.modelDao().upsertAll(merged)
+                    if (openPickerOnSuccess && merged.isNotEmpty()) {
+                        val latestProvider = db.providerDao().getById(provider.id) ?: provider
+                        _fetchedModelsPrompt.value = FetchedModelsPrompt(latestProvider, merged)
+                    }
+                    postBanner("${provider.name}: Fetched ${merged.size} models")
+                    logEvent(ActivityCategory.PROVIDER_CONNECTION, provider.name, "MODELS_FETCHED", "Discovered ${merged.size} models")
+                },
+                onFailure = { err ->
+                    postBanner("${provider.name}: ${err.message}")
+                    logEvent(ActivityCategory.PROVIDER_ERROR, provider.name, "FETCH_FAILED", err.message ?: "Failed to fetch models")
+                }
+            )
+        } finally {
+            _fetchingProviderIds.update { it - provider.id }
+        }
+    }
+
+    suspend fun fetchModelsForDraft(
+        existingProviderId: String?,
+        name: String,
+        baseUrl: String,
+        apiFormat: ApiFormat,
+        apiKeyInput: String,
+        customHeadersText: String
+    ): Result<List<ModelEntity>> {
+        val resolvedKey = if (apiKeyInput.isNotBlank()) {
+            apiKeyInput.trim()
+        } else if (existingProviderId != null) {
+            val keys = db.apiKeyDao().getForProvider(existingProviderId).filter { it.enabled }
+            val activeKey = keys.firstOrNull { it.isDefault } ?: keys.firstOrNull()
+            if (activeKey != null) {
+                CryptoManager.decryptResult(activeKey.encryptedKey).getOrElse { err ->
+                    return Result.failure(IllegalStateException(MaskingUtils.sanitizeErrorMessage(err.message)))
+                }
+            } else ""
+        } else ""
+
+        val draft = ProviderEntity(
+            id = existingProviderId ?: "draft",
+            name = name.trim().ifBlank { apiFormat.name },
+            baseUrl = baseUrl.trim().trimEnd('/'),
+            apiFormat = apiFormat,
+            customHeadersJson = buildHeadersJson(customHeadersText)
         )
+        return httpClient.fetchProviderModels(draft, resolvedKey, settings.value.localNetworkAccessAllowed)
+    }
+
+    fun dismissFetchedModelsPrompt() {
+        _fetchedModelsPrompt.value = null
+    }
+
+    fun selectModelForProvider(providerId: String, model: ModelEntity) = viewModelScope.launch {
+        val updatedModel = model.copy(isDefault = true, enabled = true)
+        var updatedProvider: ProviderEntity? = null
+        db.withTransaction {
+            db.modelDao().clearDefaultFlag()
+            db.modelDao().upsert(updatedModel)
+            db.providerDao().getById(providerId)?.let { prov ->
+                val nextProv = prov.copy(defaultModel = model.modelId)
+                db.providerDao().upsert(nextProv)
+                updatedProvider = nextProv
+            }
+        }
+        prefs.setDefaultModelAndProvider(model.modelId, providerId)
+        _fetchedModelsPrompt.update { prompt ->
+            if (prompt != null && prompt.provider.id == providerId) {
+                prompt.copy(
+                    provider = updatedProvider ?: prompt.provider.copy(defaultModel = model.modelId),
+                    models = prompt.models.map {
+                        it.copy(
+                            isDefault = it.id == model.id,
+                            enabled = if (it.id == model.id) true else it.enabled
+                        )
+                    }
+                )
+            } else prompt
+        }
+        postBanner("${updatedProvider?.name ?: model.providerName}: ${model.modelId}")
+    }
+
+    fun toggleFetchedModelEnabled(model: ModelEntity) = viewModelScope.launch {
+        val updated = model.copy(enabled = !model.enabled)
+        db.modelDao().upsert(updated)
+        _fetchedModelsPrompt.update { prompt ->
+            if (prompt != null && prompt.provider.id == model.providerId) {
+                prompt.copy(models = prompt.models.map { if (it.id == model.id) updated else it })
+            } else prompt
+        }
     }
 
     // API Key Vault
@@ -913,6 +1042,17 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         if (_activeSessionId.value == session.id) _activeSessionId.value = null
     }
 
+    fun openModelInPlayground(model: ModelEntity) {
+        _playgroundTarget.value = PlaygroundTarget(
+            providerId = model.providerId.takeIf { it.isNotBlank() },
+            modelId = model.modelId
+        )
+    }
+
+    fun consumePlaygroundTarget() {
+        _playgroundTarget.value = null
+    }
+
     fun sendPlaygroundPrompt(
         prompt: String,
         systemPrompt: String,
@@ -941,12 +1081,13 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             if (saveHistory) db.playgroundDao().insertMessage(userMsg)
             else _ephemeralMessages.update { it + userMsg }
 
-            val history = if (saveHistory) activeSessionMessages.value else _ephemeralMessages.value
+            val history = if (saveHistory) db.playgroundDao().getMessagesOnce(sid) else _ephemeralMessages.value
             val payloadMsgs = buildList {
                 if (systemPrompt.isNotBlank()) add(ChatMessagePayload("system", systemPrompt))
                 history.takeLast(12).forEach { add(ChatMessagePayload(it.role, it.content)) }
                 if (history.lastOrNull()?.content != prompt) add(ChatMessagePayload("user", prompt))
             }
+            val cleanExplicitProviderId = explicitProviderId?.takeIf { it.isNotBlank() }
 
             _isStreaming.value = true
             _streamingBuffer.value = ""
@@ -956,7 +1097,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                     requestedModelOrAlias = modelIdOrAlias,
                     messages = payloadMsgs,
                     settings = settings.value,
-                    explicitProviderId = explicitProviderId,
+                    explicitProviderId = cleanExplicitProviderId,
                     deviceName = "Playground",
                     temperature = temperature,
                     topP = topP,
@@ -1008,7 +1149,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                     requestedModelOrAlias = modelIdOrAlias,
                     messages = payloadMsgs,
                     settings = settings.value,
-                    explicitProviderId = explicitProviderId,
+                    explicitProviderId = cleanExplicitProviderId,
                     deviceName = "Playground",
                     temperature = temperature,
                     topP = topP,

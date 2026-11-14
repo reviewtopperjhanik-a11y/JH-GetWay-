@@ -486,6 +486,16 @@ interface AppStrings {
     val installPermissionMessage: String
     val openSettingsLabel: String
     val repoNotConfiguredMessage: String
+
+    // Model Picker & Playground Fixes
+    val fetchedModelsTitle: String
+    val selectModelAction: String
+    val activeModelBadge: String
+    val notSelectedLabel: String
+    val fetchingModelsLabel: String
+    val noFetchedModelsMatch: String
+    val customModelHint: String
+    val playgroundNoActiveProviderHint: String
 }
 
 val LocalStrings = staticCompositionLocalOf<AppStrings> { EnglishStrings }

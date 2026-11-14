@@ -458,4 +458,13 @@ object EnglishStrings : AppStrings {
     override val installPermissionMessage = "Enable 'Install unknown apps' for JH GetWay in Android Settings to install the downloaded APK update."
     override val openSettingsLabel = "Open Settings"
     override val repoNotConfiguredMessage = "Set your GitHub repository (owner/repo) to enable automatic in-app updates."
+
+    override val fetchedModelsTitle = "Select Fetched Model"
+    override val selectModelAction = "Select"
+    override val activeModelBadge = "Active"
+    override val notSelectedLabel = "Not selected"
+    override val fetchingModelsLabel = "Fetching models..."
+    override val noFetchedModelsMatch = "No models match your search."
+    override val customModelHint = "Custom model ID or alias (optional)"
+    override val playgroundNoActiveProviderHint = "Add or enable a provider with an API key to chat."
 }

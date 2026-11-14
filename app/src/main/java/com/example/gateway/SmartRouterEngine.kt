@@ -87,11 +87,12 @@ class SmartRouterEngine(
         )
 
         if (candidates.isEmpty()) {
+            val diagnostic = diagnoseNoCandidates(requestedModelOrAlias, settings, explicitProviderId)
             val err = ChatExecutionResult(
                 success = false,
                 statusCode = 503,
                 errorCode = "NO_ELIGIBLE_PROVIDER",
-                safeErrorMessage = "No enabled provider or local AI server available for '$requestedModelOrAlias'."
+                safeErrorMessage = diagnostic
             )
             val resolved = TokenUsageAccounting.resolveUsage(0, 0, false, messages, "", false)
             val decision = RouterDecisionSnapshot(
@@ -215,7 +216,8 @@ class SmartRouterEngine(
         )
 
         if (candidates.isEmpty()) {
-            val err = ChatExecutionResult(false, statusCode = 503, errorCode = "NO_ELIGIBLE_PROVIDER", safeErrorMessage = "No enabled provider or local AI server available.")
+            val diagnostic = diagnoseNoCandidates(requestedModelOrAlias, settings, explicitProviderId)
+            val err = ChatExecutionResult(false, statusCode = 503, errorCode = "NO_ELIGIBLE_PROVIDER", safeErrorMessage = diagnostic)
             val resolved = TokenUsageAccounting.resolveUsage(0, 0, false, messages, "", false)
             val decision = RouterDecisionSnapshot(requestId, "None", requestedModelOrAlias, reason, false, 0, 0, "FAILED", resolved)
             recordDecision(decision, err, null, deviceName, endpoint, effectiveMode.name, resolved)
@@ -345,12 +347,36 @@ class SmartRouterEngine(
         val rules = db.routingRuleDao().getAllOnce().filter { it.enabled }
         val allKeys = db.apiKeyDao().getAllOnce().filter { it.enabled }
 
-        val targetAliasOrModel = requestedModelOrAlias.ifBlank { settings.defaultModelId }
+        val targetAliasOrModel = requestedModelOrAlias.ifBlank { settings.defaultModelId }.trim()
         val matchedRule = rules.firstOrNull { it.modelAlias.equals(targetAliasOrModel, ignoreCase = true) }
         val aliasedModels = allModels.filter {
             it.alias.equals(targetAliasOrModel, ignoreCase = true) ||
                 it.modelId.equals(targetAliasOrModel, ignoreCase = true)
         }
+        val isAliasRequest = targetAliasOrModel.isBlank() ||
+            matchedRule != null ||
+            targetAliasOrModel.startsWith("jh-", ignoreCase = true) ||
+            aliasedModels.any { it.alias.equals(targetAliasOrModel, ignoreCase = true) }
+        val isSpecificModelRequest = !isAliasRequest
+
+        // Identify which enabled & credentialed providers/local servers explicitly host targetAliasOrModel
+        val matchedProviderIds = buildSet {
+            aliasedModels.forEach { add(it.providerId) }
+            providers.forEach { p ->
+                if (p.defaultModel.equals(targetAliasOrModel, ignoreCase = true)) add(p.id)
+            }
+            localServers.forEach { srv ->
+                if (srv.defaultModel.equals(targetAliasOrModel, ignoreCase = true)) add("local:${srv.id}")
+            }
+        }
+        val hasEligibleCatalogMatch = isSpecificModelRequest && (
+            providers.any { p ->
+                p.id in matchedProviderIds && selectKeysForProvider(allKeys.filter { it.providerId == p.id }).isNotEmpty()
+            } || localServers.any { srv ->
+                "local:${srv.id}" in matchedProviderIds &&
+                    (!srv.hasAuth || CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull() != null)
+            }
+        )
 
         val candidates = mutableListOf<RouteCandidate>()
 
@@ -361,24 +387,41 @@ class SmartRouterEngine(
                 val allowed = matchedRule.allowedProviderIdsCsv.split(",").map { it.trim() }
                 if (provider.id !in allowed && provider.name !in allowed) continue
             }
+            if (explicitProviderId == null && hasEligibleCatalogMatch && provider.id !in matchedProviderIds) {
+                continue
+            }
 
             val selectedKeys = selectKeysForProvider(allKeys.filter { it.providerId == provider.id })
+            if (selectedKeys.isEmpty()) continue
+
             val providerModels = allModels.filter { it.providerId == provider.id }
-            val resolvedModel = aliasedModels.firstOrNull { it.providerId == provider.id }
-                ?: providerModels.firstOrNull { it.isDefault }
-                ?: providerModels.firstOrNull()
-            val modelId = resolvedModel?.modelId?.ifBlank { null }
-                ?: targetAliasOrModel.takeIf { it.isNotBlank() && !it.startsWith("jh-") }
-                ?: provider.defaultModel
+            val matchedCatalogModel = aliasedModels.firstOrNull { it.providerId == provider.id }
+            val resolvedModel = when {
+                explicitProviderId != null && isSpecificModelRequest -> matchedCatalogModel
+                isSpecificModelRequest -> matchedCatalogModel
+                else -> matchedCatalogModel
+                    ?: providerModels.firstOrNull { it.isDefault }
+                    ?: provider.defaultModel.takeIf { it.isNotBlank() }?.let { defId ->
+                        providerModels.firstOrNull { it.modelId.equals(defId, ignoreCase = true) }
+                    }
+                    ?: providerModels.firstOrNull {
+                        it.modelType != ModelType.EMBEDDING && it.modelType != ModelType.IMAGE_GENERATION
+                    }
+                    ?: providerModels.firstOrNull()
+            }
+            val modelId = when {
+                isSpecificModelRequest && (explicitProviderId != null || !hasEligibleCatalogMatch) ->
+                    resolvedModel?.modelId?.ifBlank { null } ?: targetAliasOrModel
+                else ->
+                    resolvedModel?.modelId?.ifBlank { null }
+                        ?: provider.defaultModel.ifBlank { null }
+                        ?: targetAliasOrModel.takeIf { it.isNotBlank() && !it.startsWith("jh-", ignoreCase = true) }
+                        ?: ""
+            }
 
             if (modelId.isBlank()) continue
             val pricing = ProviderPresets.lookupPricing(modelId)
             val estCost = pricing?.let { (it.inputPer1M + it.outputPer1M) / 2.0 }
-
-            if (selectedKeys.isEmpty()) {
-                // Allow keyless only if private local HTTP or user didn't add separate vault key yet
-                continue
-            }
 
             val caps = ProviderAdapterRegistry.adapterFor(provider.apiFormat).capabilitiesForModel(modelId, resolvedModel)
             for (key in selectedKeys) {
@@ -407,11 +450,32 @@ class SmartRouterEngine(
         for (srv in localServers) {
             val localKey = "local:${srv.id}"
             if (explicitProviderId != null && explicitProviderId != localKey) continue
+            if (explicitProviderId == null && hasEligibleCatalogMatch && localKey !in matchedProviderIds) {
+                continue
+            }
             val srvModels = allModels.filter { it.providerId == localKey }
-            val resolvedModel = aliasedModels.firstOrNull { it.providerId == localKey }
-                ?: srvModels.firstOrNull { it.isDefault }
-                ?: srvModels.firstOrNull()
-            val modelId = resolvedModel?.modelId?.ifBlank { null } ?: srv.defaultModel
+            val matchedLocalModel = aliasedModels.firstOrNull { it.providerId == localKey }
+            val resolvedModel = when {
+                explicitProviderId != null && isSpecificModelRequest -> matchedLocalModel
+                isSpecificModelRequest -> matchedLocalModel
+                else -> matchedLocalModel
+                    ?: srvModels.firstOrNull { it.isDefault }
+                    ?: srv.defaultModel.takeIf { it.isNotBlank() }?.let { defId ->
+                        srvModels.firstOrNull { it.modelId.equals(defId, ignoreCase = true) }
+                    }
+                    ?: srvModels.firstOrNull {
+                        it.modelType != ModelType.EMBEDDING && it.modelType != ModelType.IMAGE_GENERATION
+                    }
+                    ?: srvModels.firstOrNull()
+            }
+            val modelId = when {
+                isSpecificModelRequest && (explicitProviderId != null || !hasEligibleCatalogMatch) ->
+                    resolvedModel?.modelId?.ifBlank { null } ?: targetAliasOrModel
+                else ->
+                    resolvedModel?.modelId?.ifBlank { null }
+                        ?: srv.defaultModel.ifBlank { null }
+                        ?: ""
+            }
             if (modelId.isBlank()) continue
             val authToken = if (srv.hasAuth) {
                 CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull() ?: continue
@@ -436,7 +500,7 @@ class SmartRouterEngine(
             )
         }
 
-        val combined = when {
+        val combinedBase = when {
             explicitProviderId != null -> localCandidates + candidates
             settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_ONLY -> localCandidates
             settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_FIRST -> {
@@ -445,6 +509,11 @@ class SmartRouterEngine(
             settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_CLOUD_FALLBACK -> localCandidates + candidates
             settings.localRoutingPolicy == LocalRoutingPolicy.CLOUD_FIRST -> candidates + localCandidates
             else -> localCandidates + candidates
+        }
+        val combined = if (explicitProviderId == null && matchedRule?.localCloudPreference.equals("LOCAL_ONLY", true)) {
+            combinedBase.filter { it.isLocal }
+        } else {
+            combinedBase
         }
 
         val baseComparator = compareBy<RouteCandidate> { it.priority }.thenBy { it.lastLatencyMs }
@@ -497,6 +566,41 @@ class SmartRouterEngine(
             else -> "Routing Mode: ${mode.name} (${settings.localRoutingPolicy.name})"
         }
         return sorted to reason
+    }
+
+    private suspend fun diagnoseNoCandidates(
+        requestedModelOrAlias: String,
+        settings: GatewaySettingsState,
+        explicitProviderId: String?
+    ): String {
+        val enabledProviders = db.providerDao().getAllOnce().filter { it.enabled }
+        val enabledLocal = db.localAiServerDao().getAllOnce().filter { it.enabled }
+        val allKeys = db.apiKeyDao().getAllOnce().filter { it.enabled }
+
+        if (enabledProviders.isEmpty() && enabledLocal.isEmpty()) {
+            return "No enabled provider or local AI server available. Enable or add a provider first."
+        }
+        if (explicitProviderId != null && !explicitProviderId.startsWith("local:")) {
+            val prov = enabledProviders.firstOrNull { it.id == explicitProviderId }
+                ?: return "Selected provider is disabled or missing."
+            val validKeys = selectKeysForProvider(allKeys.filter { it.providerId == prov.id })
+            if (validKeys.isEmpty()) {
+                return "No active API key configured for ${prov.name}. Add a valid key in API Key Vault."
+            }
+            if (requestedModelOrAlias.isBlank() && prov.defaultModel.isBlank()) {
+                return "No model selected for ${prov.name}. Fetch models and select a default model."
+            }
+        }
+        if (explicitProviderId == null && enabledLocal.isEmpty() &&
+            (settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_ONLY ||
+                (settings.localRoutingPolicy == LocalRoutingPolicy.LOCAL_FIRST && !settings.allowCloudFallbackForLocal))
+        ) {
+            return "Local routing policy (${settings.localRoutingPolicy.name}) excludes cloud providers and no local AI server is enabled."
+        }
+        if (enabledProviders.isNotEmpty() && enabledProviders.all { p -> selectKeysForProvider(allKeys.filter { it.providerId == p.id }).isEmpty() } && enabledLocal.isEmpty()) {
+            return "No active API key found for enabled providers. Add an API key in Providers or API Key Vault."
+        }
+        return "No enabled provider or model available for '${requestedModelOrAlias.ifBlank { settings.defaultModelId.ifBlank { "default" } }}'."
     }
 
     private fun selectKeysForProvider(keys: List<ApiKeyEntity>): List<ApiKeyEntity> {

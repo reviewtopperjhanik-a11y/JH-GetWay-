@@ -48,27 +48,35 @@ class GeminiProviderAdapter : ProviderAdapter {
             val obj = arr.optJSONObject(i) ?: continue
             val rawName = obj.optString("name").removePrefix("models/")
             if (rawName.isBlank()) continue
+            val methodsArr = obj.optJSONArray("supportedGenerationMethods")
+            val methods = if (methodsArr != null) {
+                (0 until methodsArr.length()).mapNotNull { idx -> methodsArr.optString(idx).takeIf { it.isNotBlank() } }
+            } else emptyList()
+            val supportsGenerateContent = methods.isEmpty() || methods.any { it.equals("generateContent", ignoreCase = true) }
             val display = obj.optString("displayName").ifBlank { rawName }
             val ctx = obj.optInt("inputTokenLimit", 0).takeIf { it > 0 }
             val pricing = ProviderPresets.lookupPricing(rawName)
+            val inferredType = ProviderPresets.inferModelType(rawName)
+            val isChatCapable = supportsGenerateContent && inferredType != com.example.data.local.ModelType.EMBEDDING
             result += ModelEntity(
                 id = "$providerId::$rawName",
                 modelId = rawName,
                 displayName = display,
                 providerId = providerId,
                 providerName = providerName,
-                modelType = ProviderPresets.inferModelType(rawName),
-                capabilitiesCsv = "CHAT,STREAMING,TOOLS,VISION",
+                modelType = inferredType,
+                capabilitiesCsv = if (isChatCapable) "CHAT,STREAMING,TOOLS,VISION" else methods.joinToString(",").uppercase(),
                 contextWindow = ctx,
-                supportsTools = true,
-                supportsStreaming = true,
+                supportsTools = isChatCapable,
+                supportsStreaming = isChatCapable,
                 isLocal = isLocal,
                 inputPricePer1M = pricing?.inputPer1M,
                 outputPricePer1M = pricing?.outputPer1M,
-                pricingUpdatedAt = pricing?.updatedAt
+                pricingUpdatedAt = pricing?.updatedAt,
+                enabled = isChatCapable
             )
         }
-        return result
+        return result.sortedByDescending { it.enabled }
     }
 
     override fun buildChatRequest(
