@@ -15,8 +15,13 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import java.net.Socket
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [36])
 class AppUpdateManagerTest {
 
     @Test
@@ -132,24 +137,28 @@ class AppUpdateManagerTest {
             port = server.engine.resolvedConnectors().first().port
             Socket("127.0.0.1", port).use { }
             val base = "http://127.0.0.1:$port"
-            val dbgRes = AppUpdateManager.checkForUpdate(
+            val rawDbgRes = AppUpdateManager.checkForUpdate(
                 repoInput = "jhsoft/jh-getway",
                 currentVersionCode = 104,
                 currentVersionName = "1.0.4",
                 preferDebugApk = true,
                 apiBaseUrl = base
-            ) as AppUpdateCheckResult.UpdateAvailable
+            )
+            assertTrue("Expected UpdateAvailable for debug APK, got $rawDbgRes", rawDbgRes is AppUpdateCheckResult.UpdateAvailable)
+            val dbgRes = rawDbgRes as AppUpdateCheckResult.UpdateAvailable
             assertEquals("JH-GetWay-v1.0.5-debug.apk", dbgRes.release.apkFileName)
             assertEquals("dbgsha256", dbgRes.release.expectedSha256)
             assertEquals("debug-persistent", dbgRes.release.signingMode)
 
-            val relRes = AppUpdateManager.checkForUpdate(
+            val rawRelRes = AppUpdateManager.checkForUpdate(
                 repoInput = "jhsoft/jh-getway",
                 currentVersionCode = 104,
                 currentVersionName = "1.0.4",
                 preferDebugApk = false,
                 apiBaseUrl = base
-            ) as AppUpdateCheckResult.UpdateAvailable
+            )
+            assertTrue("Expected UpdateAvailable for release APK, got $rawRelRes", rawRelRes is AppUpdateCheckResult.UpdateAvailable)
+            val relRes = rawRelRes as AppUpdateCheckResult.UpdateAvailable
             assertEquals("JH-GetWay-v1.0.5-release.apk", relRes.release.apkFileName)
             assertEquals("relsha256", relRes.release.expectedSha256)
             assertEquals("ci-ephemeral", relRes.release.signingMode)
