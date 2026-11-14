@@ -142,6 +142,7 @@ object TokenUsageAccounting {
             msg.content.length + msg.contentParts.sumOf { part ->
                 when (part) {
                     is ContentPart.Text -> part.text.length
+                    is ContentPart.FileAttachment -> part.textContent?.length ?: 0
                     is ContentPart.ToolUse -> part.name.length + part.argumentsJson.length
                     is ContentPart.ToolResult -> part.content.length
                     is ContentPart.ImageUrl -> 0

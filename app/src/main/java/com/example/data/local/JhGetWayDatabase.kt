@@ -34,6 +34,8 @@ class EnumConverters {
     @TypeConverter fun toDeviceConnType(v: String): DeviceConnectionType = DeviceConnectionType.valueOf(v)
     @TypeConverter fun fromActivityCategory(v: ActivityCategory): String = v.name
     @TypeConverter fun toActivityCategory(v: String): ActivityCategory = ActivityCategory.valueOf(v)
+    @TypeConverter fun fromAccessTier(v: AccessTier): String = v.name
+    @TypeConverter fun toAccessTier(v: String): AccessTier = runCatching { AccessTier.valueOf(v) }.getOrDefault(AccessTier.UNKNOWN)
 }
 
 @Database(
@@ -54,7 +56,7 @@ class EnumConverters {
         PlaygroundSessionEntity::class,
         PlaygroundMessageEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = true
 )
 @TypeConverters(EnumConverters::class)
@@ -119,7 +121,23 @@ abstract class JhGetWayDatabase : RoomDatabase() {
             }
         }
 
-        val ALL_MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE models ADD COLUMN accessTier TEXT NOT NULL DEFAULT 'UNKNOWN'")
+                db.execSQL("ALTER TABLE models ADD COLUMN freeTierVerified INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE models ADD COLUMN freeTierSource TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE models ADD COLUMN freeTierVerifiedAt INTEGER")
+                db.execSQL("ALTER TABLE models ADD COLUMN freeTierLimitsNote TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE models ADD COLUMN supportsChat INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("ALTER TABLE models ADD COLUMN supportsVision INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("UPDATE models SET accessTier = 'LOCAL' WHERE isLocal = 1 AND accessTier = 'UNKNOWN'")
+                db.execSQL("UPDATE models SET supportsChat = CASE WHEN modelType IN ('EMBEDDING', 'IMAGE_GENERATION', 'AUDIO') THEN 0 ELSE 1 END")
+                db.execSQL("UPDATE models SET supportsVision = CASE WHEN modelType IN ('VISION', 'MULTIMODAL') OR UPPER(capabilitiesCsv) LIKE '%VISION%' THEN 1 ELSE 0 END")
+                db.execSQL("ALTER TABLE playground_messages ADD COLUMN attachmentsMetadataJson TEXT NOT NULL DEFAULT '[]'")
+            }
+        }
+
+        val ALL_MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
 
         fun getInstance(context: Context): JhGetWayDatabase {
             return INSTANCE ?: synchronized(this) {

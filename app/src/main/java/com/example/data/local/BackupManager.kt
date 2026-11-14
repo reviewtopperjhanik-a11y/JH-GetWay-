@@ -70,7 +70,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
 
     companion object {
         const val CURRENT_BACKUP_FORMAT_VERSION = 2
-        const val CURRENT_DB_SCHEMA_VERSION = 4
+        const val CURRENT_DB_SCHEMA_VERSION = 5
     }
 
     private data class StagedArchive(
@@ -167,6 +167,13 @@ class BackupManager(private val db: JhGetWayDatabase) {
                 put("enabled", m.enabled)
                 put("isDefault", m.isDefault)
                 put("alias", m.alias)
+                put("accessTier", m.accessTier.name)
+                put("freeTierVerified", m.freeTierVerified)
+                put("freeTierSource", m.freeTierSource)
+                put("freeTierVerifiedAt", m.freeTierVerifiedAt ?: JSONObject.NULL)
+                put("freeTierLimitsNote", m.freeTierLimitsNote)
+                put("supportsChat", m.supportsChat)
+                put("supportsVision", m.supportsVision)
             })
         }
         dataObj.put("models", modelsArr)
@@ -656,7 +663,14 @@ class BackupManager(private val db: JhGetWayDatabase) {
                             pricingUpdatedAt = if (o.isNull("pricingUpdatedAt")) null else o.optString("pricingUpdatedAt"),
                             enabled = o.optBoolean("enabled", true),
                             isDefault = o.optBoolean("isDefault", false),
-                            alias = o.optString("alias")
+                            alias = o.optString("alias"),
+                            accessTier = parseEnum(o.optString("accessTier"), if (o.optBoolean("isLocal", false)) AccessTier.LOCAL else AccessTier.UNKNOWN),
+                            freeTierVerified = o.optBoolean("freeTierVerified", false),
+                            freeTierSource = o.optString("freeTierSource"),
+                            freeTierVerifiedAt = if (o.isNull("freeTierVerifiedAt") || !o.has("freeTierVerifiedAt")) null else o.optLong("freeTierVerifiedAt"),
+                            freeTierLimitsNote = o.optString("freeTierLimitsNote"),
+                            supportsChat = o.optBoolean("supportsChat", true),
+                            supportsVision = o.optBoolean("supportsVision", false)
                         )
                     )
                 }

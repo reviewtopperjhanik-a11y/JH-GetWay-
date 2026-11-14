@@ -35,7 +35,8 @@ class DataRetentionManager(private val db: JhGetWayDatabase) {
         logRetentionDays: Int,
         usageRetentionDays: Int,
         playgroundRetentionDays: Int,
-        nowMs: Long = System.currentTimeMillis()
+        nowMs: Long = System.currentTimeMillis(),
+        onExpiredAttachments: (List<String>) -> Unit = {}
     ): RetentionPruneReport {
         val safeLogDays = logRetentionDays.coerceIn(MIN_RETENTION_DAYS, MAX_RETENTION_DAYS)
         val safeUsageDays = usageRetentionDays.coerceIn(MIN_RETENTION_DAYS, MAX_RETENTION_DAYS)
@@ -45,7 +46,7 @@ class DataRetentionManager(private val db: JhGetWayDatabase) {
         val usageCutoff = nowMs - safeUsageDays * MILLIS_PER_DAY
         val playgroundCutoff = nowMs - safePlaygroundDays * MILLIS_PER_DAY
 
-        return db.withTransaction {
+        val (report, expiredAttachments) = db.withTransaction {
             val metricAndLogDao = db.metricAndLogDao()
             val deletedLogsAge = metricAndLogDao.deleteLogsOlderThan(logCutoff)
             val deletedLogsCap = metricAndLogDao.trimLogsToMaxRows(MAX_ACTIVITY_LOG_ROWS)
@@ -56,6 +57,7 @@ class DataRetentionManager(private val db: JhGetWayDatabase) {
             val deletedRuns = db.workflowDao().deleteRunsOlderThan(usageCutoff)
 
             val playgroundDao = db.playgroundDao()
+            val attachmentMetaToPrune = playgroundDao.getAttachmentMetadataOlderThan(playgroundCutoff)
             val deletedMsgsExpiredSessions = playgroundDao.deleteMessagesForExpiredSessions(playgroundCutoff)
             val deletedMsgsOld = playgroundDao.deleteMessagesOlderThan(playgroundCutoff)
             val deletedSessions = playgroundDao.deleteSessionsOlderThan(playgroundCutoff)
@@ -66,7 +68,11 @@ class DataRetentionManager(private val db: JhGetWayDatabase) {
                 deletedWorkflowRuns = deletedRuns,
                 deletedPlaygroundMessages = deletedMsgsExpiredSessions + deletedMsgsOld,
                 deletedPlaygroundSessions = deletedSessions
-            )
+            ) to attachmentMetaToPrune
         }
+        if (expiredAttachments.isNotEmpty()) {
+            onExpiredAttachments(expiredAttachments)
+        }
+        return report
     }
 }

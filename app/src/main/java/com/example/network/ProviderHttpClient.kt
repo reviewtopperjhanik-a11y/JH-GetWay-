@@ -327,6 +327,16 @@ class ProviderHttpClient(
                 }
                 adapter.parseChatResponse(bodyStr, latency, resp.code)
             }
+        } catch (e: IllegalArgumentException) {
+            val latency = (System.nanoTime() - start) / 1_000_000L
+            ChatExecutionResult(
+                success = false,
+                latencyMs = latency,
+                statusCode = 400,
+                errorCode = "UNSUPPORTED_CAPABILITY",
+                safeErrorMessage = MaskingUtils.sanitizeErrorMessage(e.message, listOf(apiKey)),
+                retryable = false
+            )
         } catch (e: SocketTimeoutException) {
             val latency = (System.nanoTime() - start) / 1_000_000L
             ChatExecutionResult(false, latencyMs = latency, statusCode = 504, errorCode = "TIMEOUT", safeErrorMessage = "Request timed out", retryable = true)
@@ -393,7 +403,24 @@ class ProviderHttpClient(
             return@callbackFlow
         }
 
-        val request = adapter.buildChatRequest(baseUrl, apiKey, customHeadersJson, params, caps, stream = true)
+        val request = try {
+            adapter.buildChatRequest(baseUrl, apiKey, customHeadersJson, params, caps, stream = true)
+        } catch (e: IllegalArgumentException) {
+            trySend(
+                StreamEvent.Failed(
+                    ChatExecutionResult(
+                        success = false,
+                        statusCode = 400,
+                        errorCode = "UNSUPPORTED_CAPABILITY",
+                        safeErrorMessage = MaskingUtils.sanitizeErrorMessage(e.message, listOf(apiKey)),
+                        retryable = false
+                    ),
+                    emittedAnyChunk = false
+                )
+            )
+            close()
+            return@callbackFlow
+        }
         val call = buildClient(timeoutSec, allowLocalHttp).newCall(request)
 
         val job = launch(Dispatchers.IO) {

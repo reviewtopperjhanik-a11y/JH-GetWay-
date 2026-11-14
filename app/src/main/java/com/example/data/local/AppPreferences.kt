@@ -18,7 +18,7 @@ private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(na
 
 enum class GatewayMode { LOCAL, REMOTE, EXISTING }
 enum class RoutingMode {
-    MANUAL, AUTOMATIC, PRIORITY, ROUND_ROBIN, LOWEST_LATENCY, LOWEST_COST, LOCAL_FIRST, CLOUD_FIRST
+    MANUAL, AUTOMATIC, PRIORITY, ROUND_ROBIN, LOWEST_LATENCY, LOWEST_COST, LOCAL_FIRST, CLOUD_FIRST, AUTO_FREE
 }
 enum class LocalRoutingPolicy { LOCAL_ONLY, LOCAL_FIRST, CLOUD_FIRST, LOCAL_CLOUD_FALLBACK }
 enum class LoggingLevel { MINIMAL, METADATA_ONLY, STANDARD }
@@ -67,7 +67,9 @@ data class GatewaySettingsState(
     val notifySecurityEvent: Boolean = true,
     val githubUpdateRepo: String = "",
     val autoCheckUpdates: Boolean = true,
-    val skippedUpdateTag: String = ""
+    val skippedUpdateTag: String = "",
+    val manualModelFallbackEnabled: Boolean = false,
+    val autoFreeIncludeLocal: Boolean = false
 )
 
 class AppPreferences(private val context: Context) {
@@ -116,6 +118,8 @@ class AppPreferences(private val context: Context) {
         val GITHUB_UPDATE_REPO = stringPreferencesKey("github_update_repo")
         val AUTO_CHECK_UPDATES = booleanPreferencesKey("auto_check_updates")
         val SKIPPED_UPDATE_TAG = stringPreferencesKey("skipped_update_tag")
+        val MANUAL_MODEL_FALLBACK = booleanPreferencesKey("manual_model_fallback_enabled")
+        val AUTO_FREE_INCLUDE_LOCAL = booleanPreferencesKey("auto_free_include_local")
     }
 
     val settingsFlow: Flow<GatewaySettingsState> = context.dataStore.data.map { p ->
@@ -163,7 +167,9 @@ class AppPreferences(private val context: Context) {
             notifySecurityEvent = p[Keys.NOTIFY_SECURITY] ?: true,
             githubUpdateRepo = p[Keys.GITHUB_UPDATE_REPO] ?: "",
             autoCheckUpdates = p[Keys.AUTO_CHECK_UPDATES] ?: true,
-            skippedUpdateTag = p[Keys.SKIPPED_UPDATE_TAG] ?: ""
+            skippedUpdateTag = p[Keys.SKIPPED_UPDATE_TAG] ?: "",
+            manualModelFallbackEnabled = p[Keys.MANUAL_MODEL_FALLBACK] ?: false,
+            autoFreeIncludeLocal = p[Keys.AUTO_FREE_INCLUDE_LOCAL] ?: false
         )
     }
 
@@ -279,6 +285,12 @@ class AppPreferences(private val context: Context) {
     }
     suspend fun setSkippedUpdateTag(tag: String) = context.dataStore.edit {
         it[Keys.SKIPPED_UPDATE_TAG] = tag.trim()
+    }
+    suspend fun setManualModelFallbackEnabled(enabled: Boolean) = context.dataStore.edit {
+        it[Keys.MANUAL_MODEL_FALLBACK] = enabled
+    }
+    suspend fun setAutoFreeIncludeLocal(enabled: Boolean) = context.dataStore.edit {
+        it[Keys.AUTO_FREE_INCLUDE_LOCAL] = enabled
     }
 
     suspend fun clearAll() {

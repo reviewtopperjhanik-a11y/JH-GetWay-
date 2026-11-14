@@ -512,7 +512,7 @@ class PhaseEAdvancedIntegrationsTest {
             .allowMainThreadQueries()
             .build()
         try {
-            assertEquals(4, migratedDb.openHelper.writableDatabase.version)
+            assertEquals(5, migratedDb.openHelper.writableDatabase.version)
             runBlocking {
                 val wfs = migratedDb.workflowDao().getWorkflowsOnce()
                 assertEquals(1, wfs.size)

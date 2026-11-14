@@ -13,6 +13,13 @@ import org.json.JSONObject
 sealed interface ContentPart {
     data class Text(val text: String) : ContentPart
     data class ImageUrl(val url: String, val detail: String? = null) : ContentPart
+    data class FileAttachment(
+        val fileName: String,
+        val mimeType: String,
+        val base64Data: String? = null,
+        val textContent: String? = null,
+        val sizeBytes: Long = 0L
+    ) : ContentPart
     data class ToolUse(val id: String, val name: String, val argumentsJson: String) : ContentPart
     data class ToolResult(val toolCallId: String, val content: String, val isError: Boolean = false) : ContentPart
 }
@@ -60,7 +67,9 @@ data class ProviderCapabilities(
     val supportsSystemRole: Boolean = true,
     val supportsDeveloperRole: Boolean = false,
     val supportsVision: Boolean = true,
-    val supportsStopSequences: Boolean = true
+    val supportsStopSequences: Boolean = true,
+    val supportsDocumentFiles: Boolean = false,
+    val supportedDocumentMimeTypes: Set<String> = emptySet()
 )
 
 class AdapterStreamState {
@@ -239,6 +248,9 @@ internal object AdapterHelper {
         val joined = parts.mapNotNull {
             when (it) {
                 is ContentPart.Text -> it.text
+                is ContentPart.FileAttachment -> it.textContent?.let { txt ->
+                    "Attached file (${it.fileName}, ${it.mimeType}):\n```\n$txt\n```"
+                }
                 is ContentPart.ToolResult -> it.content
                 else -> null
             }

@@ -310,6 +310,12 @@ interface PlaygroundDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMessage(message: PlaygroundMessageEntity)
 
+    @Query("SELECT attachmentsMetadataJson FROM playground_messages WHERE sessionId = :sessionId AND attachmentsMetadataJson != '[]'")
+    suspend fun getAttachmentMetadataForSession(sessionId: String): List<String>
+
+    @Query("SELECT attachmentsMetadataJson FROM playground_messages WHERE attachmentsMetadataJson != '[]' AND (timestamp < :cutoff OR sessionId IN (SELECT id FROM playground_sessions WHERE updatedAt < :cutoff))")
+    suspend fun getAttachmentMetadataOlderThan(cutoff: Long): List<String>
+
     @Query("DELETE FROM playground_messages WHERE sessionId = :sessionId")
     suspend fun clearMessagesForSession(sessionId: String)
 

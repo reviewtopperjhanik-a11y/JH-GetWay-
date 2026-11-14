@@ -1,5 +1,6 @@
 package com.example.network.adapters
 
+import com.example.data.local.AccessTier
 import com.example.data.local.ApiFormat
 import com.example.data.local.ModelEntity
 import com.example.network.ChatExecutionResult
@@ -22,8 +23,16 @@ class GeminiProviderAdapter : ProviderAdapter {
             supportsStreaming = !isEmbed && (modelEntity?.supportsStreaming ?: true),
             supportsSystemRole = true,
             supportsDeveloperRole = false,
-            supportsVision = true,
-            supportsStopSequences = true
+            supportsVision = !isEmbed && (modelEntity?.supportsVision ?: true),
+            supportsStopSequences = true,
+            supportsDocumentFiles = !isEmbed,
+            supportedDocumentMimeTypes = if (isEmbed) emptySet() else setOf(
+                "application/pdf",
+                "text/plain",
+                "text/markdown",
+                "text/csv",
+                "application/json"
+            )
         )
     }
 
@@ -65,7 +74,7 @@ class GeminiProviderAdapter : ProviderAdapter {
                 providerId = providerId,
                 providerName = providerName,
                 modelType = inferredType,
-                capabilitiesCsv = if (isChatCapable) "CHAT,STREAMING,TOOLS,VISION" else methods.joinToString(",").uppercase(),
+                capabilitiesCsv = if (isChatCapable) "CHAT,STREAMING,TOOLS,VISION,PDF" else methods.joinToString(",").uppercase(),
                 contextWindow = ctx,
                 supportsTools = isChatCapable,
                 supportsStreaming = isChatCapable,
@@ -73,7 +82,16 @@ class GeminiProviderAdapter : ProviderAdapter {
                 inputPricePer1M = pricing?.inputPer1M,
                 outputPricePer1M = pricing?.outputPer1M,
                 pricingUpdatedAt = pricing?.updatedAt,
-                enabled = isChatCapable
+                enabled = isChatCapable,
+                accessTier = when {
+                    isLocal -> AccessTier.LOCAL
+                    pricing != null && (pricing.inputPer1M > 0.0 || pricing.outputPer1M > 0.0) -> AccessTier.PAID
+                    else -> AccessTier.UNKNOWN
+                },
+                freeTierVerified = false,
+                freeTierSource = if (pricing != null) "Catalog Pricing" else "",
+                supportsChat = isChatCapable,
+                supportsVision = isChatCapable
             )
         }
         return result.sortedByDescending { it.enabled }
@@ -122,6 +140,9 @@ class GeminiProviderAdapter : ProviderAdapter {
                             when (p) {
                                 is ContentPart.Text -> if (p.text.isNotEmpty()) partsArr.put(JSONObject().put("text", p.text))
                                 is ContentPart.ImageUrl -> {
+                                    if (!capabilities.supportsVision) {
+                                        throw IllegalArgumentException("Model ${params.modelId} does not support image attachments.")
+                                    }
                                     if (p.url.startsWith("data:", true) && p.url.contains(",")) {
                                         val comma = p.url.indexOf(',')
                                         val mime = p.url.substring(5, comma).substringBefore(';').ifBlank { "image/png" }
@@ -137,6 +158,31 @@ class GeminiProviderAdapter : ProviderAdapter {
                                                 "fileData",
                                                 JSONObject().put("mimeType", "image/jpeg").put("fileUri", p.url)
                                             )
+                                        )
+                                    }
+                                }
+                                is ContentPart.FileAttachment -> {
+                                    when {
+                                        p.mimeType == "application/pdf" && p.base64Data != null -> {
+                                            partsArr.put(
+                                                JSONObject().put(
+                                                    "inlineData",
+                                                    JSONObject()
+                                                        .put("mimeType", "application/pdf")
+                                                        .put("data", p.base64Data)
+                                                )
+                                            )
+                                        }
+                                        p.mimeType in capabilities.supportedDocumentMimeTypes && p.textContent != null -> {
+                                            partsArr.put(
+                                                JSONObject().put(
+                                                    "text",
+                                                    "Attached file (${p.fileName}, ${p.mimeType}):\n```\n${p.textContent}\n```"
+                                                )
+                                            )
+                                        }
+                                        else -> throw IllegalArgumentException(
+                                            "Gemini model ${params.modelId} does not support attachment '${p.fileName}' (${p.mimeType})."
                                         )
                                     }
                                 }
@@ -346,7 +392,9 @@ class CohereProviderAdapter : ProviderAdapter {
             supportsSystemRole = true,
             supportsDeveloperRole = false,
             supportsVision = false,
-            supportsStopSequences = true
+            supportsStopSequences = true,
+            supportsDocumentFiles = true,
+            supportedDocumentMimeTypes = setOf("text/plain", "text/markdown", "text/csv", "application/json")
         )
 
     override fun buildModelsUrl(baseUrl: String): String = "${baseUrl.trimEnd('/')}/models"
@@ -368,8 +416,19 @@ class CohereProviderAdapter : ProviderAdapter {
     ): Request {
         val clean = baseUrl.trimEnd('/')
         val msgs = JSONArray().apply {
-            params.messages.forEach {
-                put(JSONObject().put("role", it.role).put("content", AdapterHelper.plainTextFromMessageParts(it.contentParts, it.content)))
+            params.messages.forEach { msg ->
+                msg.contentParts.forEach { part ->
+                    when (part) {
+                        is ContentPart.ImageUrl -> throw IllegalArgumentException("Cohere adapter does not support image attachments.")
+                        is ContentPart.FileAttachment -> {
+                            if (part.mimeType !in capabilities.supportedDocumentMimeTypes || part.textContent == null) {
+                                throw IllegalArgumentException("Cohere adapter does not support attachment '${part.fileName}' (${part.mimeType}).")
+                            }
+                        }
+                        else -> Unit
+                    }
+                }
+                put(JSONObject().put("role", msg.role).put("content", AdapterHelper.plainTextFromMessageParts(msg.contentParts, msg.content)))
             }
         }
         val root = JSONObject().apply {
@@ -432,17 +491,28 @@ class CohereProviderAdapter : ProviderAdapter {
 class OllamaProviderAdapter : ProviderAdapter {
     override val apiFormat: ApiFormat = ApiFormat.OLLAMA
 
-    override fun capabilitiesForModel(modelId: String, modelEntity: ModelEntity?): ProviderCapabilities =
-        ProviderCapabilities(
-            supportsTools = modelEntity?.supportsTools ?: (modelId.contains("qwen", true) || modelId.contains("llama3", true) || modelId.contains("mistral", true)),
+    override fun capabilitiesForModel(modelId: String, modelEntity: ModelEntity?): ProviderCapabilities {
+        val isEmbed = modelId.contains("embed", true)
+        val hasVision = !isEmbed && (
+            modelEntity?.supportsVision == true ||
+                modelId.contains("llava", true) ||
+                modelId.contains("vl", true) ||
+                modelId.contains("gemma3", true) ||
+                modelId.contains("vision", true)
+            )
+        return ProviderCapabilities(
+            supportsTools = !isEmbed && (modelEntity?.supportsTools ?: (modelId.contains("qwen", true) || modelId.contains("llama3", true) || modelId.contains("mistral", true))),
             supportsToolChoice = false,
-            supportsJsonOutput = true,
-            supportsStreaming = true,
+            supportsJsonOutput = !isEmbed,
+            supportsStreaming = !isEmbed,
             supportsSystemRole = true,
             supportsDeveloperRole = false,
-            supportsVision = modelId.contains("llava", true) || modelId.contains("vl", true),
-            supportsStopSequences = true
+            supportsVision = hasVision,
+            supportsStopSequences = true,
+            supportsDocumentFiles = !isEmbed,
+            supportedDocumentMimeTypes = if (isEmbed) emptySet() else setOf("text/plain", "text/markdown", "text/csv", "application/json")
         )
+    }
 
     override fun buildModelsUrl(baseUrl: String): String {
         val clean = baseUrl.trimEnd('/')
@@ -461,6 +531,8 @@ class OllamaProviderAdapter : ProviderAdapter {
             val obj = arr.optJSONObject(i) ?: continue
             val name = obj.optString("name")
             if (name.isBlank()) continue
+            val hasVision = name.contains("llava", true) || name.contains("vl", true) || name.contains("gemma3", true) || name.contains("vision", true)
+            val isChat = !name.contains("embed", true)
             result += ModelEntity(
                 id = "$providerId::$name",
                 modelId = name,
@@ -468,11 +540,21 @@ class OllamaProviderAdapter : ProviderAdapter {
                 providerId = providerId,
                 providerName = providerName,
                 modelType = ProviderPresets.inferModelType(name),
-                capabilitiesCsv = "CHAT,STREAMING,LOCAL",
+                capabilitiesCsv = buildList {
+                    if (isChat) add("CHAT")
+                    add("STREAMING")
+                    add("LOCAL")
+                    if (hasVision) add("VISION")
+                }.joinToString(","),
                 contextWindow = null,
                 supportsTools = name.contains("qwen", true) || name.contains("llama3", true) || name.contains("mistral", true),
                 supportsStreaming = true,
-                isLocal = true
+                isLocal = true,
+                accessTier = AccessTier.LOCAL,
+                freeTierVerified = false,
+                freeTierSource = "Local Runtime",
+                supportsChat = isChat,
+                supportsVision = hasVision
             )
         }
         return result
@@ -490,7 +572,33 @@ class OllamaProviderAdapter : ProviderAdapter {
         val ollamaBase = if (clean.endsWith("/v1")) clean.removeSuffix("/v1") else clean
         val msgs = JSONArray().apply {
             params.messages.forEach { m ->
-                put(JSONObject().put("role", m.role).put("content", AdapterHelper.plainTextFromMessageParts(m.contentParts, m.content)))
+                val images = JSONArray()
+                m.contentParts.forEach { part ->
+                    when (part) {
+                        is ContentPart.ImageUrl -> {
+                            if (!capabilities.supportsVision) {
+                                throw IllegalArgumentException("Ollama model ${params.modelId} does not support image attachments.")
+                            }
+                            val base64 = if (part.url.startsWith("data:", true) && part.url.contains(",")) {
+                                part.url.substringAfter(',')
+                            } else {
+                                throw IllegalArgumentException("Ollama requires base64 image payloads.")
+                            }
+                            images.put(base64)
+                        }
+                        is ContentPart.FileAttachment -> {
+                            if (part.mimeType !in capabilities.supportedDocumentMimeTypes || part.textContent == null) {
+                                throw IllegalArgumentException("Ollama model ${params.modelId} does not support attachment '${part.fileName}' (${part.mimeType}).")
+                            }
+                        }
+                        else -> Unit
+                    }
+                }
+                val msgObj = JSONObject()
+                    .put("role", m.role)
+                    .put("content", AdapterHelper.plainTextFromMessageParts(m.contentParts, m.content))
+                if (images.length() > 0) msgObj.put("images", images)
+                put(msgObj)
             }
         }
         val root = JSONObject().apply {

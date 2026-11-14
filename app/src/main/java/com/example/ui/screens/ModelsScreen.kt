@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -15,6 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.example.core.i18n.LocalStrings
+import com.example.data.local.AccessTier
 import com.example.data.local.ModelEntity
 import com.example.data.local.ModelType
 import com.example.ui.GatewayViewModel
@@ -37,7 +40,10 @@ fun ModelsScreen(
     var searchQuery by remember { mutableStateOf("") }
     var selectedType by remember { mutableStateOf<ModelType?>(null) }
     var aliasTarget by remember { mutableStateOf<ModelEntity?>(null) }
-    var detailTarget by remember { mutableStateOf<ModelEntity?>(null) }
+    var detailTargetId by remember { mutableStateOf<String?>(null) }
+    val detailTarget = remember(models, detailTargetId) {
+        detailTargetId?.let { id -> models.firstOrNull { it.id == id } }
+    }
 
     val filtered = remember(models, searchQuery, selectedType) {
         models.filter { m ->
@@ -108,16 +114,28 @@ fun ModelsScreen(
                             Text(model.displayName, style = MaterialTheme.typography.titleMedium)
                             Text(model.modelId, style = MonoTextStyle, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
-                        StatusPill(
-                            text = if (model.isLocal) s.localModels else s.cloudModels,
-                            tone = if (model.isLocal) StatusTone.INFO else StatusTone.SUCCESS
-                        )
+                        val (tierText, tierTone) = when {
+                            model.isLocal || model.accessTier == AccessTier.LOCAL -> s.tierLocal to StatusTone.INFO
+                            model.accessTier == AccessTier.FREE_TIER && model.freeTierVerified && model.freeTierSource == "User Confirmed" ->
+                                s.tierUserConfirmed to StatusTone.INFO
+                            model.accessTier == AccessTier.FREE_TIER && model.freeTierVerified ->
+                                s.tierFree to StatusTone.SUCCESS
+                            model.accessTier == AccessTier.PAID -> s.tierPaid to StatusTone.WARNING
+                            else -> s.tierUnknown to StatusTone.NEUTRAL
+                        }
+                        StatusPill(text = tierText, tone = tierTone)
                     }
 
                     Spacer(Modifier.height(6.dp))
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         AssistChip(onClick = {}, label = { Text(model.providerName) })
                         AssistChip(onClick = {}, label = { Text(model.modelType.name) })
+                        if (model.supportsVision) {
+                            AssistChip(onClick = {}, label = { Text(s.visionBadge) })
+                        }
+                        if (model.supportsTools) {
+                            AssistChip(onClick = {}, label = { Text(s.toolsBadge) })
+                        }
                         if (model.alias.isNotBlank()) {
                             AssistChip(onClick = { aliasTarget = model }, label = { Text("${s.aliasPrefix}: ${model.alias}") })
                         }
@@ -137,7 +155,10 @@ fun ModelsScreen(
                                 else viewModel.selectModelForProvider(model.providerId, model)
                             }) { Text(s.setDefault) }
                         }
-                        TextButton(onClick = { detailTarget = model }) { Text(s.details) }
+                        TextButton(
+                            onClick = { detailTargetId = model.id },
+                            modifier = Modifier.testTag("model_details_${model.modelId}")
+                        ) { Text(s.details) }
                         TextButton(onClick = {
                             viewModel.openModelInPlayground(model)
                             onNavigate(Routes.PLAYGROUND)
@@ -184,24 +205,57 @@ fun ModelsScreen(
     }
 
     detailTarget?.let { m ->
+        var limitsNoteInput by remember(m.id, m.freeTierLimitsNote) { mutableStateOf(m.freeTierLimitsNote) }
         AlertDialog(
-            onDismissRequest = { detailTarget = null },
+            onDismissRequest = { detailTargetId = null },
             title = { Text(m.displayName) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
                     Text("${s.modelId}: ${m.modelId}", style = MonoTextStyle)
                     Text("${s.providersTitle}: ${m.providerName}")
                     Text("${s.modelType}: ${m.modelType.name}")
                     Text("${s.contextWindow}: ${m.contextWindow ?: s.unknown}")
+                    Text("${s.visionBadge}: ${if (m.supportsVision) s.supportedLabel else s.noLabel}")
                     Text("${s.toolCalling}: ${if (m.supportsTools) s.supportedLabel else s.noLabel}")
                     Text("${s.streamingLabel}: ${if (m.supportsStreaming) s.supportedLabel else s.noLabel}")
                     val priceText = if (m.inputPricePer1M != null && m.outputPricePer1M != null) {
-                        "$${m.inputPricePer1M} / $${m.outputPricePer1M} per 1M (${m.pricingUpdatedAt})"
+                        "$${m.inputPricePer1M} / $${m.outputPricePer1M} per 1M (${m.pricingUpdatedAt ?: "-"})"
                     } else s.unknown
                     Text("${s.estimatedCost}: $priceText")
+                    if (m.freeTierSource.isNotBlank()) {
+                        Text("${s.verificationSourceLabel}: ${m.freeTierSource}")
+                    }
+                    if (!m.isLocal) {
+                        Spacer(Modifier.height(4.dp))
+                        OutlinedTextField(
+                            value = limitsNoteInput,
+                            onValueChange = { limitsNoteInput = it },
+                            label = { Text(s.limitsNoteLabel) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        val isUserConfirmedFree = m.freeTierSource == "User Confirmed" && m.freeTierVerified
+                        OutlinedButton(
+                            onClick = {
+                                viewModel.setModelFreeTierConfirmed(
+                                    model = m,
+                                    confirmed = !isUserConfirmedFree,
+                                    limitsNote = limitsNoteInput
+                                )
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag(if (isUserConfirmedFree) "model_revoke_free_btn" else "model_confirm_free_btn")
+                        ) {
+                            Text(if (isUserConfirmedFree) s.clearFreeAccessAction else s.confirmFreeAccessAction)
+                        }
+                    }
                 }
             },
-            confirmButton = { TextButton(onClick = { detailTarget = null }) { Text(s.close) } }
+            confirmButton = { TextButton(onClick = { detailTargetId = null }) { Text(s.close) } }
         )
     }
 }

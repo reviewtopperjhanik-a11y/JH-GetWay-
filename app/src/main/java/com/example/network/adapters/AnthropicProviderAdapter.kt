@@ -1,5 +1,6 @@
 package com.example.network.adapters
 
+import com.example.data.local.AccessTier
 import com.example.data.local.ApiFormat
 import com.example.data.local.ModelEntity
 import com.example.network.ChatExecutionResult
@@ -21,8 +22,16 @@ class AnthropicProviderAdapter : ProviderAdapter {
             supportsStreaming = modelEntity?.supportsStreaming ?: true,
             supportsSystemRole = true,
             supportsDeveloperRole = false,
-            supportsVision = true,
-            supportsStopSequences = true
+            supportsVision = modelEntity?.supportsVision ?: true,
+            supportsStopSequences = true,
+            supportsDocumentFiles = true,
+            supportedDocumentMimeTypes = setOf(
+                "application/pdf",
+                "text/plain",
+                "text/markdown",
+                "text/csv",
+                "application/json"
+            )
         )
 
     private fun v1Base(baseUrl: String): String {
@@ -65,14 +74,23 @@ class AnthropicProviderAdapter : ProviderAdapter {
                 providerId = providerId,
                 providerName = providerName,
                 modelType = ProviderPresets.inferModelType(id),
-                capabilitiesCsv = "CHAT,STREAMING,TOOLS,VISION",
+                capabilitiesCsv = "CHAT,STREAMING,TOOLS,VISION,PDF",
                 contextWindow = obj.optInt("context_length", 200_000),
                 supportsTools = true,
                 supportsStreaming = true,
                 isLocal = isLocal,
                 inputPricePer1M = pricing?.inputPer1M,
                 outputPricePer1M = pricing?.outputPer1M,
-                pricingUpdatedAt = pricing?.updatedAt
+                pricingUpdatedAt = pricing?.updatedAt,
+                accessTier = when {
+                    isLocal -> AccessTier.LOCAL
+                    pricing != null && (pricing.inputPer1M > 0.0 || pricing.outputPer1M > 0.0) -> AccessTier.PAID
+                    else -> AccessTier.UNKNOWN
+                },
+                freeTierVerified = false,
+                freeTierSource = if (pricing != null) "Catalog Pricing" else "",
+                supportsChat = true,
+                supportsVision = true
             )
         }
         return result
@@ -124,11 +142,46 @@ class AnthropicProviderAdapter : ProviderAdapter {
                             blocks.put(JSONObject().put("type", "text").put("text", part.text))
                         }
                         is ContentPart.ImageUrl -> {
+                            if (!capabilities.supportsVision) {
+                                throw IllegalArgumentException("Model ${params.modelId} does not support image attachments.")
+                            }
                             val srcObj = parseAnthropicImageSource(part.url)
-                            if (srcObj != null) {
-                                blocks.put(JSONObject().put("type", "image").put("source", srcObj))
-                            } else {
-                                blocks.put(JSONObject().put("type", "text").put("text", "[Image URL: ${part.url}]"))
+                                ?: throw IllegalArgumentException("Unsupported image URL format for Anthropic.")
+                            blocks.put(JSONObject().put("type", "image").put("source", srcObj))
+                        }
+                        is ContentPart.FileAttachment -> {
+                            when {
+                                part.mimeType == "application/pdf" && part.base64Data != null -> {
+                                    blocks.put(
+                                        JSONObject()
+                                            .put("type", "document")
+                                            .put(
+                                                "source",
+                                                JSONObject()
+                                                    .put("type", "base64")
+                                                    .put("media_type", "application/pdf")
+                                                    .put("data", part.base64Data)
+                                            )
+                                            .put("title", part.fileName)
+                                    )
+                                }
+                                part.mimeType in capabilities.supportedDocumentMimeTypes && part.textContent != null -> {
+                                    blocks.put(
+                                        JSONObject()
+                                            .put("type", "document")
+                                            .put(
+                                                "source",
+                                                JSONObject()
+                                                    .put("type", "text")
+                                                    .put("media_type", "text/plain")
+                                                    .put("data", part.textContent)
+                                            )
+                                            .put("title", part.fileName)
+                                    )
+                                }
+                                else -> throw IllegalArgumentException(
+                                    "Anthropic model ${params.modelId} does not support attachment '${part.fileName}' (${part.mimeType})."
+                                )
                             }
                         }
                         is ContentPart.ToolUse -> {

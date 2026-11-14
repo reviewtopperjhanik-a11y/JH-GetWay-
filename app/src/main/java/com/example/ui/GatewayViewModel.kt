@@ -21,6 +21,8 @@ import com.example.gateway.*
 import com.example.network.ChatMessagePayload
 import com.example.network.ProviderPresets
 import com.example.network.StreamEvent
+import com.example.network.adapters.ContentPart
+import com.example.network.adapters.ProviderAdapterRegistry
 import com.example.ui.theme.ThemeMode
 import com.example.updater.ApkInstallLaunchResult
 import com.example.updater.AppReleaseInfo
@@ -119,6 +121,17 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
 
     val localServers: StateFlow<List<LocalAiServerEntity>> = db.localAiServerDao().observeAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val eligibleAutoFreeCount: StateFlow<Int> = combine(
+        providers,
+        localServers,
+        models,
+        apiKeys,
+        settings
+    ) { _, _, _, _, s -> s }
+        .mapLatest { s -> router.countEligibleAutoFreeModels(s) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
     val mcpServers: StateFlow<List<McpServerEntity>> = db.mcpDao().observeServers()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -221,7 +234,10 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             retentionManager.enforcePolicies(
                 logRetentionDays = s.logRetentionDays,
                 usageRetentionDays = s.usageRetentionDays,
-                playgroundRetentionDays = s.playgroundRetentionDays
+                playgroundRetentionDays = s.playgroundRetentionDays,
+                onExpiredAttachments = { metaList ->
+                    PlaygroundAttachmentManager.deleteAttachmentsFromMetadata(app, metaList)
+                }
             )
             val isRobolectric = android.os.Build.FINGERPRINT.equals("robolectric", ignoreCase = true)
             if (!isRobolectric && s.autoCheckUpdates && effectiveGithubUpdateRepo(s).isNotBlank()) {
@@ -354,18 +370,40 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             val matched = existingModels.firstOrNull { it.modelId == trimmedModel }
             if (matched == null) {
                 val pricing = ProviderPresets.lookupPricing(trimmedModel)
+                val caps = ProviderAdapterRegistry.adapterFor(apiFormat).capabilitiesForModel(trimmedModel, null)
+                val modelType = ProviderPresets.inferModelType(trimmedModel)
+                val isChatCapable = modelType != ModelType.EMBEDDING &&
+                    modelType != ModelType.IMAGE_GENERATION &&
+                    modelType != ModelType.AUDIO
+                val isCatalogFree = trimmedModel.endsWith(":free", ignoreCase = true)
+                val hasPositivePricing = pricing != null && (pricing.inputPer1M > 0.0 || pricing.outputPer1M > 0.0)
                 val entity = ModelEntity(
                     id = "${provider.id}::$trimmedModel",
                     modelId = trimmedModel,
                     displayName = trimmedModel,
                     providerId = provider.id,
                     providerName = provider.name,
-                    modelType = ProviderPresets.inferModelType(trimmedModel),
+                    modelType = modelType,
                     inputPricePer1M = pricing?.inputPer1M,
                     outputPricePer1M = pricing?.outputPer1M,
                     pricingUpdatedAt = pricing?.updatedAt,
                     isDefault = shouldSetGlobalDefault,
-                    enabled = true
+                    enabled = true,
+                    accessTier = when {
+                        isCatalogFree -> AccessTier.FREE_TIER
+                        hasPositivePricing -> AccessTier.PAID
+                        else -> AccessTier.UNKNOWN
+                    },
+                    freeTierVerified = isCatalogFree,
+                    freeTierSource = when {
+                        isCatalogFree -> "Provider Catalog (:free)"
+                        hasPositivePricing -> "Catalog Pricing"
+                        else -> ""
+                    },
+                    freeTierVerifiedAt = if (isCatalogFree) System.currentTimeMillis() else null,
+                    freeTierLimitsNote = if (isCatalogFree) "Provider free-tier rate/daily limits apply" else "",
+                    supportsChat = isChatCapable,
+                    supportsVision = caps.supportsVision
                 )
                 if (shouldSetGlobalDefault) {
                     db.withTransaction {
@@ -465,7 +503,19 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                     val existing = db.modelDao().getByProvider(provider.id).associateBy { it.modelId }
                     val merged = fetched.map { m ->
                         val prev = existing[m.modelId]
-                        if (prev != null) m.copy(alias = prev.alias, isDefault = prev.isDefault, enabled = prev.enabled) else m
+                        if (prev != null) {
+                            val preserveUserConfirmedFree = prev.freeTierSource == "User Confirmed" && prev.freeTierVerified
+                            m.copy(
+                                alias = prev.alias,
+                                isDefault = prev.isDefault,
+                                enabled = prev.enabled,
+                                accessTier = if (preserveUserConfirmedFree) AccessTier.FREE_TIER else m.accessTier,
+                                freeTierVerified = if (preserveUserConfirmedFree) true else m.freeTierVerified,
+                                freeTierSource = if (preserveUserConfirmedFree) prev.freeTierSource else m.freeTierSource,
+                                freeTierVerifiedAt = if (preserveUserConfirmedFree) prev.freeTierVerifiedAt else m.freeTierVerifiedAt,
+                                freeTierLimitsNote = prev.freeTierLimitsNote.ifBlank { m.freeTierLimitsNote }
+                            )
+                        } else m
                     }
                     db.modelDao().upsertAll(merged)
                     if (openPickerOnSuccess && merged.isNotEmpty()) {
@@ -668,6 +718,41 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
 
     fun setModelAlias(model: ModelEntity, alias: String) = viewModelScope.launch {
         db.modelDao().upsert(model.copy(alias = alias.trim()))
+    }
+
+    fun setModelFreeTierConfirmed(model: ModelEntity, confirmed: Boolean, limitsNote: String = "") = viewModelScope.launch {
+        val hasPositivePrice = (model.inputPricePer1M ?: 0.0) > 0.0 || (model.outputPricePer1M ?: 0.0) > 0.0
+        val updated = if (confirmed) {
+            model.copy(
+                accessTier = AccessTier.FREE_TIER,
+                freeTierVerified = true,
+                freeTierSource = "User Confirmed",
+                freeTierVerifiedAt = System.currentTimeMillis(),
+                freeTierLimitsNote = limitsNote.trim().ifBlank { model.freeTierLimitsNote }
+            )
+        } else {
+            val isCatalogFree = model.modelId.endsWith(":free", ignoreCase = true) && !hasPositivePrice
+            model.copy(
+                accessTier = when {
+                    model.isLocal -> AccessTier.LOCAL
+                    isCatalogFree -> AccessTier.FREE_TIER
+                    hasPositivePrice -> AccessTier.PAID
+                    else -> AccessTier.UNKNOWN
+                },
+                freeTierVerified = isCatalogFree,
+                freeTierSource = if (isCatalogFree) "Provider Catalog (:free)" else "",
+                freeTierVerifiedAt = if (isCatalogFree) System.currentTimeMillis() else null
+            )
+        }
+        db.modelDao().upsert(updated)
+    }
+
+    fun setManualModelFallbackEnabled(enabled: Boolean) = viewModelScope.launch {
+        prefs.setManualModelFallbackEnabled(enabled)
+    }
+
+    fun setAutoFreeIncludeLocal(enabled: Boolean) = viewModelScope.launch {
+        prefs.setAutoFreeIncludeLocal(enabled)
     }
 
     // Smart Router & Rules
@@ -1031,12 +1116,17 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
 
     fun clearActiveChat() = viewModelScope.launch {
         _activeSessionId.value?.let { sid ->
+            val metaList = db.playgroundDao().getAttachmentMetadataForSession(sid)
+            PlaygroundAttachmentManager.deleteAttachmentsFromMetadata(app, metaList)
             db.playgroundDao().clearMessagesForSession(sid)
         }
         _ephemeralMessages.value = emptyList()
+        PlaygroundAttachmentManager.cleanupEphemeralCache(app)
     }
 
     fun deleteSession(session: PlaygroundSessionEntity) = viewModelScope.launch {
+        val metaList = db.playgroundDao().getAttachmentMetadataForSession(session.id)
+        PlaygroundAttachmentManager.deleteAttachmentsFromMetadata(app, metaList)
         db.withTransaction {
             db.playgroundDao().deleteSession(session.id)
             db.playgroundDao().clearMessagesForSession(session.id)
@@ -1055,6 +1145,57 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         _playgroundTarget.value = null
     }
 
+    fun stopPlaygroundStreaming() {
+        val partial = _streamingBuffer.value
+        val sid = _activeSessionId.value
+        val saveHistory = settings.value.saveChatHistoryAllowed
+        streamingJob?.cancel()
+        streamingJob = null
+        _streamingBuffer.value = ""
+        _isStreaming.value = false
+        if (partial.isNotBlank() && sid != null) {
+            viewModelScope.launch {
+                val partialMsg = PlaygroundMessageEntity(
+                    sessionId = sid,
+                    role = "assistant",
+                    content = partial,
+                    modelId = "Stopped",
+                    providerName = ""
+                )
+                if (saveHistory) db.playgroundDao().insertMessage(partialMsg)
+                else _ephemeralMessages.update { it + partialMsg }
+            }
+        }
+    }
+
+    private suspend fun validateManualAttachmentCapabilities(
+        explicitProviderId: String?,
+        modelIdOrAlias: String,
+        attachments: List<PendingAttachment>
+    ): String? {
+        if (attachments.isEmpty() || explicitProviderId.isNullOrBlank()) return null
+        val modelEntity = db.modelDao().getByProvider(explicitProviderId)
+            .firstOrNull { it.modelId.equals(modelIdOrAlias, ignoreCase = true) }
+        val apiFormat = if (explicitProviderId.startsWith("local:")) {
+            val srvId = explicitProviderId.removePrefix("local:")
+            val srv = db.localAiServerDao().getAllOnce().firstOrNull { it.id == srvId } ?: return null
+            if (srv.engineType == LocalEngineType.OLLAMA) ApiFormat.OLLAMA else ApiFormat.OPENAI
+        } else {
+            val prov = db.providerDao().getById(explicitProviderId) ?: return null
+            prov.apiFormat
+        }
+        val caps = ProviderAdapterRegistry.adapterFor(apiFormat).capabilitiesForModel(modelIdOrAlias, modelEntity)
+        for (att in attachments) {
+            if (att.category == AttachmentCategory.IMAGE && !caps.supportsVision) {
+                return "Model '$modelIdOrAlias' (${apiFormat.name}) does not support image attachments."
+            }
+            if (att.category == AttachmentCategory.DOCUMENT && att.mimeType !in caps.supportedDocumentMimeTypes) {
+                return "Model '$modelIdOrAlias' (${apiFormat.name}) does not support ${att.mimeType} files ('${att.displayName}')."
+            }
+        }
+        return null
+    }
+
     fun sendPlaygroundPrompt(
         prompt: String,
         systemPrompt: String,
@@ -1065,121 +1206,220 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         maxTokens: Int,
         stopSequences: List<String>,
         jsonOutput: Boolean,
-        streaming: Boolean
+        streaming: Boolean,
+        isAutoMode: Boolean = false,
+        attachments: List<PendingAttachment> = emptyList(),
+        onRequestAccepted: () -> Unit = {},
+        onValidationError: (String) -> Unit = {}
     ) {
-        if (prompt.isBlank()) return
+        if (prompt.isBlank() && attachments.isEmpty()) return
         streamingJob?.cancel()
         streamingJob = viewModelScope.launch {
+            val cleanExplicitProviderId = explicitProviderId?.takeIf { it.isNotBlank() }
+            val needsVision = attachments.any { it.category == AttachmentCategory.IMAGE }
+            val neededDocMimes = attachments.filter { it.category == AttachmentCategory.DOCUMENT }
+                .map { it.mimeType }.toSet()
+
+            // Pre-send capability validation before mutating conversation history or clearing draft
+            if (isAutoMode || cleanExplicitProviderId == null) {
+                val (autoCandidates, _) = router.resolveCandidates(
+                    requestedModelOrAlias = "",
+                    settings = settings.value,
+                    mode = RoutingMode.AUTO_FREE,
+                    explicitProviderId = null,
+                    requireVision = needsVision,
+                    requiredDocumentMimeTypes = neededDocMimes
+                )
+                if (autoCandidates.isEmpty()) {
+                    val (unfilteredFree, _) = router.resolveCandidates(
+                        requestedModelOrAlias = "",
+                        settings = settings.value,
+                        mode = RoutingMode.AUTO_FREE,
+                        explicitProviderId = null
+                    )
+                    val errText = if (attachments.isNotEmpty() && unfilteredFree.isNotEmpty()) {
+                        "No verified free models support the attached file type(s)."
+                    } else {
+                        "No verified free models available. Configure a free-tier provider, confirm free access in Models, or select a specific model."
+                    }
+                    onValidationError(errText)
+                    postBanner(errText)
+                    return@launch
+                }
+            } else {
+                val unsupportedMsg = validateManualAttachmentCapabilities(
+                    explicitProviderId = cleanExplicitProviderId,
+                    modelIdOrAlias = modelIdOrAlias,
+                    attachments = attachments
+                )
+                if (unsupportedMsg != null) {
+                    onValidationError(unsupportedMsg)
+                    postBanner(unsupportedMsg)
+                    return@launch
+                }
+            }
+
+            val userParts: List<ContentPart> = if (attachments.isNotEmpty()) {
+                try {
+                    withContext(Dispatchers.IO) {
+                        PlaygroundAttachmentManager.buildContentParts(prompt, attachments)
+                    }
+                } catch (e: Exception) {
+                    val safeMsg = MaskingUtils.sanitizeErrorMessage(e.message)
+                    onValidationError(safeMsg)
+                    postBanner(safeMsg)
+                    return@launch
+                }
+            } else {
+                listOf(ContentPart.Text(prompt))
+            }
+
+            onRequestAccepted()
+
             val saveHistory = settings.value.saveChatHistoryAllowed
             var sid = _activeSessionId.value
+            val sessionTitle = prompt.trim().ifBlank { attachments.firstOrNull()?.displayName ?: "Attachment" }.take(28)
             if (sid == null) {
-                val newSession = PlaygroundSessionEntity(title = prompt.take(28), modelId = modelIdOrAlias, systemPrompt = systemPrompt)
+                val newSession = PlaygroundSessionEntity(title = sessionTitle, modelId = modelIdOrAlias, systemPrompt = systemPrompt)
                 sid = newSession.id
                 _activeSessionId.value = sid
                 if (saveHistory) db.playgroundDao().upsertSession(newSession)
             }
 
-            val userMsg = PlaygroundMessageEntity(sessionId = sid, role = "user", content = prompt)
+            val metaJson = if (saveHistory) PlaygroundAttachmentManager.toMetadataJson(attachments) else "[]"
+            val userMsg = PlaygroundMessageEntity(
+                sessionId = sid,
+                role = "user",
+                content = prompt,
+                attachmentsMetadataJson = metaJson
+            )
             if (saveHistory) db.playgroundDao().insertMessage(userMsg)
             else _ephemeralMessages.update { it + userMsg }
 
             val history = if (saveHistory) db.playgroundDao().getMessagesOnce(sid) else _ephemeralMessages.value
             val payloadMsgs = buildList {
                 if (systemPrompt.isNotBlank()) add(ChatMessagePayload("system", systemPrompt))
-                history.takeLast(12).forEach { add(ChatMessagePayload(it.role, it.content)) }
-                if (history.lastOrNull()?.content != prompt) add(ChatMessagePayload("user", prompt))
+                val priorHistory = if (history.lastOrNull()?.id == userMsg.id) history.dropLast(1) else history
+                priorHistory.takeLast(11).forEach { add(ChatMessagePayload(it.role, it.content)) }
+                add(ChatMessagePayload(role = "user", content = prompt, contentParts = userParts))
             }
-            val cleanExplicitProviderId = explicitProviderId?.takeIf { it.isNotBlank() }
+
+            val routingModeForRequest = if (isAutoMode || cleanExplicitProviderId == null) {
+                RoutingMode.AUTO_FREE
+            } else {
+                RoutingMode.MANUAL
+            }
+            val allowFallbackForRequest = if (routingModeForRequest == RoutingMode.AUTO_FREE) {
+                true
+            } else {
+                settings.value.manualModelFallbackEnabled && settings.value.fallbackEnabled
+            }
 
             _isStreaming.value = true
             _streamingBuffer.value = ""
 
-            if (streaming) {
-                router.streamRoutedChat(
-                    requestedModelOrAlias = modelIdOrAlias,
-                    messages = payloadMsgs,
-                    settings = settings.value,
-                    explicitProviderId = cleanExplicitProviderId,
-                    deviceName = "Playground",
-                    temperature = temperature,
-                    topP = topP,
-                    maxTokens = maxTokens,
-                    stopSequences = stopSequences,
-                    jsonOutput = jsonOutput
-                ).collect { (event, decision) ->
-                    when (event) {
-                        is StreamEvent.Delta -> _streamingBuffer.update { it + event.text }
-                        is StreamEvent.Completed -> {
-                            val pricing = ProviderPresets.lookupPricing(decision?.selectedModel.orEmpty())
-                            val estCost = pricing?.let {
-                                (event.result.inputTokens / 1_000_000.0) * it.inputPer1M +
-                                    (event.result.outputTokens / 1_000_000.0) * it.outputPer1M
+            try {
+                if (streaming) {
+                    router.streamRoutedChat(
+                        requestedModelOrAlias = if (routingModeForRequest == RoutingMode.AUTO_FREE) "" else modelIdOrAlias,
+                        messages = payloadMsgs,
+                        settings = settings.value,
+                        routingModeOverride = routingModeForRequest,
+                        explicitProviderId = cleanExplicitProviderId,
+                        deviceName = "Playground",
+                        temperature = temperature,
+                        topP = topP,
+                        maxTokens = maxTokens,
+                        stopSequences = stopSequences,
+                        jsonOutput = jsonOutput,
+                        requireVision = needsVision,
+                        requiredDocumentMimeTypes = neededDocMimes,
+                        fallbackOverride = allowFallbackForRequest
+                    ).collect { (event, decision) ->
+                        when (event) {
+                            is StreamEvent.Delta -> _streamingBuffer.update { it + event.text }
+                            is StreamEvent.Completed -> {
+                                val pricing = ProviderPresets.lookupPricing(decision?.selectedModel.orEmpty())
+                                val estCost = pricing?.let {
+                                    (event.result.inputTokens / 1_000_000.0) * it.inputPer1M +
+                                        (event.result.outputTokens / 1_000_000.0) * it.outputPer1M
+                                }
+                                val assistantMsg = PlaygroundMessageEntity(
+                                    sessionId = sid,
+                                    role = "assistant",
+                                    content = event.result.content,
+                                    modelId = decision?.selectedModel ?: modelIdOrAlias,
+                                    providerName = decision?.selectedProvider.orEmpty(),
+                                    latencyMs = event.result.latencyMs,
+                                    inputTokens = event.result.inputTokens,
+                                    outputTokens = event.result.outputTokens,
+                                    estimatedCostUsd = estCost
+                                )
+                                if (saveHistory) db.playgroundDao().insertMessage(assistantMsg)
+                                else _ephemeralMessages.update { it + assistantMsg }
+                                _streamingBuffer.value = ""
                             }
-                            val assistantMsg = PlaygroundMessageEntity(
-                                sessionId = sid,
-                                role = "assistant",
-                                content = event.result.content,
-                                modelId = decision?.selectedModel ?: modelIdOrAlias,
-                                providerName = decision?.selectedProvider.orEmpty(),
-                                latencyMs = event.result.latencyMs,
-                                inputTokens = event.result.inputTokens,
-                                outputTokens = event.result.outputTokens,
-                                estimatedCostUsd = estCost
-                            )
-                            if (saveHistory) db.playgroundDao().insertMessage(assistantMsg)
-                            else _ephemeralMessages.update { it + assistantMsg }
-                            _streamingBuffer.value = ""
-                        }
-                        is StreamEvent.Failed -> {
-                            val errMsg = PlaygroundMessageEntity(
-                                sessionId = sid,
-                                role = "assistant",
-                                content = event.error.safeErrorMessage ?: "Request failed",
-                                modelId = decision?.selectedModel ?: modelIdOrAlias,
-                                providerName = decision?.selectedProvider.orEmpty(),
-                                latencyMs = event.error.latencyMs,
-                                isError = true
-                            )
-                            if (saveHistory) db.playgroundDao().insertMessage(errMsg)
-                            else _ephemeralMessages.update { it + errMsg }
-                            _streamingBuffer.value = ""
+                            is StreamEvent.Failed -> {
+                                val errMsg = PlaygroundMessageEntity(
+                                    sessionId = sid,
+                                    role = "assistant",
+                                    content = event.error.safeErrorMessage ?: "Request failed",
+                                    modelId = decision?.selectedModel ?: modelIdOrAlias,
+                                    providerName = decision?.selectedProvider.orEmpty(),
+                                    latencyMs = event.error.latencyMs,
+                                    isError = true
+                                )
+                                if (saveHistory) db.playgroundDao().insertMessage(errMsg)
+                                else _ephemeralMessages.update { it + errMsg }
+                                _streamingBuffer.value = ""
+                            }
                         }
                     }
+                } else {
+                    val res = router.executeRoutedChat(
+                        requestedModelOrAlias = if (routingModeForRequest == RoutingMode.AUTO_FREE) "" else modelIdOrAlias,
+                        messages = payloadMsgs,
+                        settings = settings.value,
+                        routingModeOverride = routingModeForRequest,
+                        explicitProviderId = cleanExplicitProviderId,
+                        deviceName = "Playground",
+                        temperature = temperature,
+                        topP = topP,
+                        maxTokens = maxTokens,
+                        stopSequences = stopSequences,
+                        jsonOutput = jsonOutput,
+                        requireVision = needsVision,
+                        requiredDocumentMimeTypes = neededDocMimes,
+                        fallbackOverride = allowFallbackForRequest
+                    )
+                    val pricing = ProviderPresets.lookupPricing(res.decision.selectedModel)
+                    val estCost = pricing?.let {
+                        (res.execution.inputTokens / 1_000_000.0) * it.inputPer1M +
+                            (res.execution.outputTokens / 1_000_000.0) * it.outputPer1M
+                    }
+                    val msg = PlaygroundMessageEntity(
+                        sessionId = sid,
+                        role = "assistant",
+                        content = if (res.execution.success) res.execution.content else (res.execution.safeErrorMessage ?: "Error"),
+                        modelId = res.decision.selectedModel,
+                        providerName = res.decision.selectedProvider,
+                        latencyMs = res.execution.latencyMs,
+                        inputTokens = res.execution.inputTokens,
+                        outputTokens = res.execution.outputTokens,
+                        estimatedCostUsd = estCost,
+                        isError = !res.execution.success
+                    )
+                    if (saveHistory) db.playgroundDao().insertMessage(msg)
+                    else _ephemeralMessages.update { it + msg }
                 }
-            } else {
-                val res = router.executeRoutedChat(
-                    requestedModelOrAlias = modelIdOrAlias,
-                    messages = payloadMsgs,
-                    settings = settings.value,
-                    explicitProviderId = cleanExplicitProviderId,
-                    deviceName = "Playground",
-                    temperature = temperature,
-                    topP = topP,
-                    maxTokens = maxTokens,
-                    stopSequences = stopSequences,
-                    jsonOutput = jsonOutput
-                )
-                val pricing = ProviderPresets.lookupPricing(res.decision.selectedModel)
-                val estCost = pricing?.let {
-                    (res.execution.inputTokens / 1_000_000.0) * it.inputPer1M +
-                        (res.execution.outputTokens / 1_000_000.0) * it.outputPer1M
+            } finally {
+                _isStreaming.value = false
+                if (!saveHistory) {
+                    attachments.forEach { att ->
+                        PlaygroundAttachmentManager.deleteFileIfOwned(app, att.localFilePath)
+                    }
                 }
-                val msg = PlaygroundMessageEntity(
-                    sessionId = sid,
-                    role = "assistant",
-                    content = if (res.execution.success) res.execution.content else (res.execution.safeErrorMessage ?: "Error"),
-                    modelId = res.decision.selectedModel,
-                    providerName = res.decision.selectedProvider,
-                    latencyMs = res.execution.latencyMs,
-                    inputTokens = res.execution.inputTokens,
-                    outputTokens = res.execution.outputTokens,
-                    estimatedCostUsd = estCost,
-                    isError = !res.execution.success
-                )
-                if (saveHistory) db.playgroundDao().insertMessage(msg)
-                else _ephemeralMessages.update { it + msg }
             }
-            _isStreaming.value = false
         }
     }
 
@@ -1403,7 +1643,10 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         val report = retentionManager.enforcePolicies(
             logRetentionDays = s.logRetentionDays,
             usageRetentionDays = s.usageRetentionDays,
-            playgroundRetentionDays = s.playgroundRetentionDays
+            playgroundRetentionDays = s.playgroundRetentionDays,
+            onExpiredAttachments = { metaList ->
+                PlaygroundAttachmentManager.deleteAttachmentsFromMetadata(app, metaList)
+            }
         )
         logEvent(
             ActivityCategory.SYSTEM_EVENT,
@@ -1578,6 +1821,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
             db.playgroundDao().clearSessions()
             workflowEngine.builtInTemplates().forEach { db.workflowDao().upsertWorkflow(it) }
         }
+        PlaygroundAttachmentManager.cleanupAllOwnedAttachments(app)
         postBanner("Local data cleared")
     }
 

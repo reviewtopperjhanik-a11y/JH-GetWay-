@@ -499,6 +499,55 @@ interface AppStrings {
     val updateSigningConflictMessage: String
     val ephemeralReleaseWarning: String
     val openReleasePageLabel: String
+
+    // ChatGPT-Style Playground, Attachments & Auto-Free Routing
+    val attachMenuTitle: String
+    val attachActionDesc: String
+    val cameraOption: String
+    val cameraSubtitle: String
+    val photosOption: String
+    val photosSubtitle: String
+    val filesOption: String
+    val filesSubtitle: String
+    val stopGenerating: String
+    val sessionHistory: String
+    val emptyChatTitle: String
+    val emptyChatSubtitle: String
+    val removeAttachment: String
+    val emptyPromptError: String
+    val cameraUnavailableError: String
+    val cameraCaptureFailedError: String
+    val unsupportedFileTypeError: String
+    val fileTooLargeError: String
+    val attachmentLimitError: String
+    val attachmentReadError: String
+    val cloudUploadDisclosure: String
+    val unsupportedAttachmentForModelError: String
+    val attachmentsCountLabel: String
+    val modelSelectorTitle: String
+    val autoShortLabel: String
+    val autoFreeTitle: String
+    val autoFreeDescription: String
+    val eligibleFreeModelsCount: String
+    val noEligibleFreeModels: String
+    val noEligibleFreeModelsHint: String
+    val reviewProvidersLabel: String
+    val reviewModelsLabel: String
+    val tierFree: String
+    val tierPaid: String
+    val tierLocal: String
+    val tierUnknown: String
+    val tierUserConfirmed: String
+    val confirmFreeAccessAction: String
+    val clearFreeAccessAction: String
+    val verificationSourceLabel: String
+    val limitsNoteLabel: String
+    val visionBadge: String
+    val toolsBadge: String
+    val manualFallbackLabel: String
+    val autoFreeIncludeLocalLabel: String
+    val localSectionTitle: String
+    val pinnedProviderLabel: String
 }
 
 val LocalStrings = staticCompositionLocalOf<AppStrings> { EnglishStrings }

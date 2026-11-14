@@ -1,5 +1,6 @@
 package com.example.network.adapters
 
+import com.example.data.local.AccessTier
 import com.example.data.local.ApiFormat
 import com.example.data.local.ModelEntity
 import com.example.network.ChatExecutionResult
@@ -18,6 +19,11 @@ class OpenAiProviderAdapter(
         val lower = modelId.lowercase()
         val isEmbed = lower.contains("embed")
         val isReasoning = lower.startsWith("o1") || lower.startsWith("o3") || lower.startsWith("o4") || lower.contains("deepseek-reasoner")
+        val inferredVision = lower.contains("gpt-4o") || lower.contains("gpt-4.1") ||
+            lower.contains("gpt-4-turbo") || lower.startsWith("o1") || lower.startsWith("o3") ||
+            lower.startsWith("o4") || lower.contains("vision") || lower.contains("claude") ||
+            lower.contains("gemini") || lower.contains("vl") || lower.contains("pixtral") ||
+            lower.contains("llama-4") || lower.contains("gemma-3")
         return ProviderCapabilities(
             supportsTools = !isEmbed && (modelEntity?.supportsTools ?: true),
             supportsToolChoice = !isEmbed && (modelEntity?.supportsTools ?: true),
@@ -25,8 +31,15 @@ class OpenAiProviderAdapter(
             supportsStreaming = !isEmbed && (modelEntity?.supportsStreaming ?: true),
             supportsSystemRole = !lower.startsWith("o1-mini") && !lower.startsWith("o1-preview"),
             supportsDeveloperRole = true,
-            supportsVision = lower.contains("gpt-4o") || lower.contains("gpt-4.1") || lower.contains("vision") || lower.contains("claude") || lower.contains("gemini") || lower.contains("vl"),
-            supportsStopSequences = !isReasoning
+            supportsVision = !isEmbed && (modelEntity?.supportsVision == true || inferredVision),
+            supportsStopSequences = !isReasoning,
+            supportsDocumentFiles = !isEmbed,
+            supportedDocumentMimeTypes = if (isEmbed) emptySet() else setOf(
+                "text/plain",
+                "text/markdown",
+                "text/csv",
+                "application/json"
+            )
         )
     }
 
@@ -54,8 +67,35 @@ class OpenAiProviderAdapter(
             val display = obj.optString("display_name").ifBlank { id }
             val ctx = obj.optInt("context_length", obj.optInt("context_window", 0)).takeIf { it > 0 }
             val pricing = if (isLocal) null else ProviderPresets.lookupPricing(id)
-            val supportsTools = !id.contains("embed", true)
-            val supportsStreaming = !id.contains("embed", true)
+            val objPricing = obj.optJSONObject("pricing")
+            val promptPrice = objPricing?.optString("prompt")?.toDoubleOrNull()
+            val completionPrice = objPricing?.optString("completion")?.toDoubleOrNull()
+            val isCatalogFreeSuffix = id.endsWith(":free", ignoreCase = true)
+            val isExplicitCatalogFree = !isLocal && isCatalogFreeSuffix &&
+                (promptPrice == null || promptPrice == 0.0) &&
+                (completionPrice == null || completionPrice == 0.0)
+            val hasPositivePrice = !isLocal && (
+                (pricing != null && (pricing.inputPer1M > 0.0 || pricing.outputPer1M > 0.0)) ||
+                    (promptPrice != null && promptPrice > 0.0) ||
+                    (completionPrice != null && completionPrice > 0.0)
+                )
+            val accessTier = when {
+                isLocal -> AccessTier.LOCAL
+                isExplicitCatalogFree -> AccessTier.FREE_TIER
+                hasPositivePrice -> AccessTier.PAID
+                else -> AccessTier.UNKNOWN
+            }
+            val lower = id.lowercase()
+            val isChatCapable = !lower.contains("embed") && !lower.contains("whisper") && !lower.contains("tts") && !lower.contains("dall-e")
+            val archModality = obj.optJSONObject("architecture")?.optString("modality").orEmpty().lowercase()
+            val supportsVision = isChatCapable && (
+                archModality.contains("image") ||
+                    lower.contains("gpt-4o") || lower.contains("gpt-4.1") || lower.contains("vision") ||
+                    lower.contains("claude") || lower.contains("gemini") || lower.contains("vl") ||
+                    lower.contains("pixtral") || lower.contains("llama-4") || lower.contains("gemma-3")
+                )
+            val supportsTools = isChatCapable
+            val supportsStreaming = isChatCapable
             result += ModelEntity(
                 id = "$providerId::$id",
                 modelId = id,
@@ -63,14 +103,32 @@ class OpenAiProviderAdapter(
                 providerId = providerId,
                 providerName = providerName,
                 modelType = ProviderPresets.inferModelType(id),
-                capabilitiesCsv = if (isLocal) "CHAT,STREAMING,LOCAL" else "CHAT,STREAMING,TOOLS",
+                capabilitiesCsv = buildList {
+                    if (isChatCapable) add("CHAT")
+                    if (supportsStreaming) add("STREAMING")
+                    if (supportsTools) add("TOOLS")
+                    if (supportsVision) add("VISION")
+                    if (isLocal) add("LOCAL")
+                }.joinToString(","),
                 contextWindow = ctx,
                 supportsTools = supportsTools,
                 supportsStreaming = supportsStreaming,
                 isLocal = isLocal,
-                inputPricePer1M = pricing?.inputPer1M,
-                outputPricePer1M = pricing?.outputPer1M,
-                pricingUpdatedAt = pricing?.updatedAt
+                inputPricePer1M = pricing?.inputPer1M ?: promptPrice?.let { it * 1_000_000.0 },
+                outputPricePer1M = pricing?.outputPer1M ?: completionPrice?.let { it * 1_000_000.0 },
+                pricingUpdatedAt = pricing?.updatedAt,
+                accessTier = accessTier,
+                freeTierVerified = isExplicitCatalogFree,
+                freeTierSource = when {
+                    isLocal -> "Local Runtime"
+                    isExplicitCatalogFree -> "Provider Catalog (:free)"
+                    hasPositivePrice -> "Catalog Pricing"
+                    else -> ""
+                },
+                freeTierVerifiedAt = if (isExplicitCatalogFree) System.currentTimeMillis() else null,
+                freeTierLimitsNote = if (isExplicitCatalogFree) "Provider free-tier rate/daily limits apply" else "",
+                supportsChat = isChatCapable,
+                supportsVision = supportsVision
             )
         }
         return result
@@ -127,12 +185,25 @@ class OpenAiProviderAdapter(
                                 JSONObject().put("type", "text").put("text", part.text)
                             )
                             is ContentPart.ImageUrl -> {
-                                if (capabilities.supportsVision) {
-                                    val imgObj = JSONObject().put("url", part.url)
-                                    if (!part.detail.isNullOrBlank()) imgObj.put("detail", part.detail)
-                                    partsArr.put(JSONObject().put("type", "image_url").put("image_url", imgObj))
+                                if (!capabilities.supportsVision) {
+                                    throw IllegalArgumentException("Model ${params.modelId} does not support image attachments.")
+                                }
+                                val imgObj = JSONObject().put("url", part.url)
+                                if (!part.detail.isNullOrBlank()) imgObj.put("detail", part.detail)
+                                partsArr.put(JSONObject().put("type", "image_url").put("image_url", imgObj))
+                            }
+                            is ContentPart.FileAttachment -> {
+                                if (part.mimeType in capabilities.supportedDocumentMimeTypes && part.textContent != null) {
+                                    partsArr.put(
+                                        JSONObject().put("type", "text").put(
+                                            "text",
+                                            "Attached file (${part.fileName}, ${part.mimeType}):\n```\n${part.textContent}\n```"
+                                        )
+                                    )
                                 } else {
-                                    partsArr.put(JSONObject().put("type", "text").put("text", "[Image attached: ${part.url.take(64)}]"))
+                                    throw IllegalArgumentException(
+                                        "Model ${params.modelId} (${apiFormat.name}) does not support attachment '${part.fileName}' (${part.mimeType})."
+                                    )
                                 }
                             }
                             is ContentPart.ToolResult -> partsArr.put(

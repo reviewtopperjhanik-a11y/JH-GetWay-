@@ -42,7 +42,10 @@ data class RouteCandidate(
     val priority: Int,
     val lastLatencyMs: Long,
     val estimatedCostPer1M: Double?,
-    val capabilities: ProviderCapabilities = ProviderCapabilities()
+    val capabilities: ProviderCapabilities = ProviderCapabilities(),
+    val providerStatus: ProviderStatus = ProviderStatus.UNKNOWN,
+    val accessTier: AccessTier = if (isLocal) AccessTier.LOCAL else AccessTier.UNKNOWN,
+    val freeTierVerified: Boolean = false
 )
 
 data class RoutedChatResult(
@@ -54,11 +57,82 @@ class SmartRouterEngine(
     private val db: JhGetWayDatabase,
     private val httpClient: ProviderHttpClient
 ) {
+    companion object {
+        const val COOLDOWN_WINDOW_MS = 60_000L
+    }
+
     private val roundRobinCounter = AtomicInteger(0)
     private val keyRoundRobinCounter = AtomicInteger(0)
 
     private val _recentDecisions = MutableStateFlow<List<RouterDecisionSnapshot>>(emptyList())
     val recentDecisions: StateFlow<List<RouterDecisionSnapshot>> = _recentDecisions.asStateFlow()
+
+    private fun extractMessageCapabilities(
+        messages: List<ChatMessagePayload>,
+        requireVision: Boolean,
+        requiredDocumentMimeTypes: Set<String>
+    ): Pair<Boolean, Set<String>> {
+        val needsVision = requireVision || messages.any { m ->
+            m.contentParts.any { it is com.example.network.adapters.ContentPart.ImageUrl }
+        }
+        val docMimes = buildSet {
+            addAll(requiredDocumentMimeTypes)
+            messages.forEach { m ->
+                m.contentParts.forEach { part ->
+                    if (part is com.example.network.adapters.ContentPart.FileAttachment) {
+                        add(part.mimeType)
+                    }
+                }
+            }
+        }
+        return needsVision to docMimes
+    }
+
+    private fun candidateSupportsAttachments(
+        capabilities: ProviderCapabilities,
+        needsVision: Boolean,
+        requiredDocMimes: Set<String>
+    ): Boolean {
+        if (needsVision && !capabilities.supportsVision) return false
+        if (requiredDocMimes.isNotEmpty() && !requiredDocMimes.all { it in capabilities.supportedDocumentMimeTypes }) {
+            return false
+        }
+        return true
+    }
+
+    private fun isProviderCoolingDown(provider: ProviderEntity, nowMs: Long): Boolean {
+        if (provider.status != ProviderStatus.ERROR && provider.status != ProviderStatus.RATE_LIMITED) return false
+        val checkedAt = provider.lastCheckedAt ?: return false
+        return (nowMs - checkedAt) in 0 until COOLDOWN_WINDOW_MS
+    }
+
+    private fun healthRank(status: ProviderStatus): Int = when (status) {
+        ProviderStatus.CONNECTED -> 0
+        ProviderStatus.UNKNOWN -> 1
+        ProviderStatus.CHECKING -> 2
+        ProviderStatus.DISCONNECTED -> 3
+        ProviderStatus.RATE_LIMITED -> 4
+        ProviderStatus.ERROR -> 5
+        ProviderStatus.DISABLED -> 6
+    }
+
+    suspend fun countEligibleAutoFreeModels(
+        settings: GatewaySettingsState,
+        requireVision: Boolean = false,
+        requiredDocumentMimeTypes: Set<String> = emptySet(),
+        nowMs: Long = System.currentTimeMillis()
+    ): Int {
+        val (candidates, _) = resolveCandidates(
+            requestedModelOrAlias = "",
+            settings = settings,
+            mode = RoutingMode.AUTO_FREE,
+            explicitProviderId = null,
+            requireVision = requireVision,
+            requiredDocumentMimeTypes = requiredDocumentMimeTypes,
+            nowMs = nowMs
+        )
+        return candidates.distinctBy { "${it.id}::${it.modelId}" }.size
+    }
 
     suspend fun executeRoutedChat(
         requestedModelOrAlias: String,
@@ -75,19 +149,32 @@ class SmartRouterEngine(
         jsonOutput: Boolean = false,
         tools: List<NormalizedToolDefinition> = emptyList(),
         toolChoice: NormalizedToolChoice? = null,
-        responseFormat: NormalizedResponseFormat? = null
+        responseFormat: NormalizedResponseFormat? = null,
+        requireVision: Boolean = false,
+        requiredDocumentMimeTypes: Set<String> = emptySet(),
+        fallbackOverride: Boolean? = null
     ): RoutedChatResult {
         val requestId = UUID.randomUUID().toString().take(12)
         val effectiveMode = routingModeOverride ?: settings.defaultRoutingMode
+        val (needsVision, needsDocs) = extractMessageCapabilities(messages, requireVision, requiredDocumentMimeTypes)
         val (candidates, reason) = resolveCandidates(
             requestedModelOrAlias = requestedModelOrAlias,
             settings = settings,
             mode = effectiveMode,
-            explicitProviderId = explicitProviderId
+            explicitProviderId = explicitProviderId,
+            requireVision = needsVision,
+            requiredDocumentMimeTypes = needsDocs
         )
 
         if (candidates.isEmpty()) {
-            val diagnostic = diagnoseNoCandidates(requestedModelOrAlias, settings, explicitProviderId)
+            val diagnostic = diagnoseNoCandidates(
+                requestedModelOrAlias = requestedModelOrAlias,
+                settings = settings,
+                mode = effectiveMode,
+                explicitProviderId = explicitProviderId,
+                requireVision = needsVision,
+                requiredDocumentMimeTypes = needsDocs
+            )
             val err = ChatExecutionResult(
                 success = false,
                 statusCode = 503,
@@ -98,7 +185,7 @@ class SmartRouterEngine(
             val decision = RouterDecisionSnapshot(
                 requestId = requestId,
                 selectedProvider = "None",
-                selectedModel = requestedModelOrAlias.ifBlank { "Unassigned" },
+                selectedModel = requestedModelOrAlias.ifBlank { if (effectiveMode == RoutingMode.AUTO_FREE) "Auto-Free" else "Unassigned" },
                 routingReason = reason,
                 fallbackUsed = false,
                 attemptCount = 0,
@@ -110,7 +197,12 @@ class SmartRouterEngine(
             return RoutedChatResult(err, decision)
         }
 
-        val maxAttempts = if (settings.fallbackEnabled) (1 + settings.maxRetries).coerceAtMost(candidates.size) else 1
+        val allowFallback = fallbackOverride ?: if (explicitProviderId != null) {
+            settings.manualModelFallbackEnabled && settings.fallbackEnabled
+        } else {
+            settings.fallbackEnabled || effectiveMode == RoutingMode.AUTO_FREE
+        }
+        val maxAttempts = if (allowFallback) (1 + settings.maxRetries).coerceAtMost(candidates.size) else 1
         var attemptCount = 0
         var lastResult = ChatExecutionResult(false, errorCode = "UNKNOWN", safeErrorMessage = "No attempts made")
         var winningCandidate = candidates.first()
@@ -204,28 +296,56 @@ class SmartRouterEngine(
         jsonOutput: Boolean = false,
         tools: List<NormalizedToolDefinition> = emptyList(),
         toolChoice: NormalizedToolChoice? = null,
-        responseFormat: NormalizedResponseFormat? = null
+        responseFormat: NormalizedResponseFormat? = null,
+        requireVision: Boolean = false,
+        requiredDocumentMimeTypes: Set<String> = emptySet(),
+        fallbackOverride: Boolean? = null
     ): Flow<Pair<StreamEvent, RouterDecisionSnapshot?>> = flow {
         val requestId = UUID.randomUUID().toString().take(12)
         val effectiveMode = routingModeOverride ?: settings.defaultRoutingMode
+        val (needsVision, needsDocs) = extractMessageCapabilities(messages, requireVision, requiredDocumentMimeTypes)
         val (candidates, reason) = resolveCandidates(
             requestedModelOrAlias = requestedModelOrAlias,
             settings = settings,
             mode = effectiveMode,
-            explicitProviderId = explicitProviderId
+            explicitProviderId = explicitProviderId,
+            requireVision = needsVision,
+            requiredDocumentMimeTypes = needsDocs
         )
 
         if (candidates.isEmpty()) {
-            val diagnostic = diagnoseNoCandidates(requestedModelOrAlias, settings, explicitProviderId)
+            val diagnostic = diagnoseNoCandidates(
+                requestedModelOrAlias = requestedModelOrAlias,
+                settings = settings,
+                mode = effectiveMode,
+                explicitProviderId = explicitProviderId,
+                requireVision = needsVision,
+                requiredDocumentMimeTypes = needsDocs
+            )
             val err = ChatExecutionResult(false, statusCode = 503, errorCode = "NO_ELIGIBLE_PROVIDER", safeErrorMessage = diagnostic)
             val resolved = TokenUsageAccounting.resolveUsage(0, 0, false, messages, "", false)
-            val decision = RouterDecisionSnapshot(requestId, "None", requestedModelOrAlias, reason, false, 0, 0, "FAILED", resolved)
+            val decision = RouterDecisionSnapshot(
+                requestId,
+                "None",
+                requestedModelOrAlias.ifBlank { if (effectiveMode == RoutingMode.AUTO_FREE) "Auto-Free" else "Unassigned" },
+                reason,
+                false,
+                0,
+                0,
+                "FAILED",
+                resolved
+            )
             recordDecision(decision, err, null, deviceName, endpoint, effectiveMode.name, resolved)
             emit(StreamEvent.Failed(err, false) to decision)
             return@flow
         }
 
-        val maxAttempts = if (settings.fallbackEnabled) (1 + settings.maxRetries).coerceAtMost(candidates.size) else 1
+        val allowFallback = fallbackOverride ?: if (explicitProviderId != null) {
+            settings.manualModelFallbackEnabled && settings.fallbackEnabled
+        } else {
+            settings.fallbackEnabled || effectiveMode == RoutingMode.AUTO_FREE
+        }
+        val maxAttempts = if (allowFallback) (1 + settings.maxRetries).coerceAtMost(candidates.size) else 1
         var attempt = 0
 
         for (i in 0 until maxAttempts) {
@@ -339,13 +459,29 @@ class SmartRouterEngine(
         requestedModelOrAlias: String,
         settings: GatewaySettingsState,
         mode: RoutingMode,
-        explicitProviderId: String? = null
+        explicitProviderId: String? = null,
+        requireVision: Boolean = false,
+        requiredDocumentMimeTypes: Set<String> = emptySet(),
+        nowMs: Long = System.currentTimeMillis()
     ): Pair<List<RouteCandidate>, String> {
         val providers = db.providerDao().getAllOnce().filter { it.enabled }
         val localServers = db.localAiServerDao().getAllOnce().filter { it.enabled }
         val allModels = db.modelDao().getAllOnce().filter { it.enabled }
         val rules = db.routingRuleDao().getAllOnce().filter { it.enabled }
         val allKeys = db.apiKeyDao().getAllOnce().filter { it.enabled }
+
+        if (mode == RoutingMode.AUTO_FREE && explicitProviderId == null) {
+            return resolveAutoFreeCandidates(
+                providers = providers,
+                localServers = localServers,
+                allModels = allModels,
+                allKeys = allKeys,
+                settings = settings,
+                requireVision = requireVision,
+                requiredDocumentMimeTypes = requiredDocumentMimeTypes,
+                nowMs = nowMs
+            )
+        }
 
         val targetAliasOrModel = requestedModelOrAlias.ifBlank { settings.defaultModelId }.trim()
         val matchedRule = rules.firstOrNull { it.modelAlias.equals(targetAliasOrModel, ignoreCase = true) }
@@ -420,10 +556,13 @@ class SmartRouterEngine(
             }
 
             if (modelId.isBlank()) continue
+            val caps = ProviderAdapterRegistry.adapterFor(provider.apiFormat).capabilitiesForModel(modelId, resolvedModel)
+            if (explicitProviderId == null && !candidateSupportsAttachments(caps, requireVision, requiredDocumentMimeTypes)) {
+                continue
+            }
             val pricing = ProviderPresets.lookupPricing(modelId)
             val estCost = pricing?.let { (it.inputPer1M + it.outputPer1M) / 2.0 }
 
-            val caps = ProviderAdapterRegistry.adapterFor(provider.apiFormat).capabilitiesForModel(modelId, resolvedModel)
             for (key in selectedKeys) {
                 val decrypted = CryptoManager.decryptResult(key.encryptedKey).getOrNull().orEmpty()
                 if (decrypted.isBlank()) continue
@@ -440,7 +579,10 @@ class SmartRouterEngine(
                     priority = provider.priority,
                     lastLatencyMs = provider.lastLatencyMs ?: 5000L,
                     estimatedCostPer1M = estCost,
-                    capabilities = caps
+                    capabilities = caps,
+                    providerStatus = provider.status,
+                    accessTier = resolvedModel?.accessTier ?: AccessTier.UNKNOWN,
+                    freeTierVerified = resolvedModel?.freeTierVerified ?: false
                 )
             }
         }
@@ -482,6 +624,9 @@ class SmartRouterEngine(
             } else ""
             val format = if (srv.engineType == LocalEngineType.OLLAMA) ApiFormat.OLLAMA else ApiFormat.OPENAI
             val localCaps = ProviderAdapterRegistry.adapterFor(format).capabilitiesForModel(modelId, resolvedModel)
+            if (explicitProviderId == null && !candidateSupportsAttachments(localCaps, requireVision, requiredDocumentMimeTypes)) {
+                continue
+            }
 
             localCandidates += RouteCandidate(
                 id = localKey,
@@ -496,7 +641,10 @@ class SmartRouterEngine(
                 priority = 0,
                 lastLatencyMs = srv.lastLatencyMs ?: 1000L,
                 estimatedCostPer1M = 0.0,
-                capabilities = localCaps
+                capabilities = localCaps,
+                providerStatus = srv.status,
+                accessTier = AccessTier.LOCAL,
+                freeTierVerified = false
             )
         }
 
@@ -519,6 +667,7 @@ class SmartRouterEngine(
         val baseComparator = compareBy<RouteCandidate> { it.priority }.thenBy { it.lastLatencyMs }
         val sorted = when (mode) {
             RoutingMode.MANUAL -> combined
+            RoutingMode.AUTO_FREE -> combined
             RoutingMode.PRIORITY -> combined.sortedBy { it.priority }
             RoutingMode.LOWEST_LATENCY -> combined.sortedBy { it.lastLatencyMs }
             RoutingMode.LOWEST_COST -> combined.sortedBy { it.estimatedCostPer1M ?: Double.MAX_VALUE }
@@ -561,21 +710,166 @@ class SmartRouterEngine(
         }
 
         val reason = when {
-            explicitProviderId != null -> "Manual Provider Selection"
+            explicitProviderId != null -> "Manual Selection (${sorted.firstOrNull()?.displayName ?: explicitProviderId})"
             matchedRule != null -> "Rule '${matchedRule.name}' (${mode.name})"
             else -> "Routing Mode: ${mode.name} (${settings.localRoutingPolicy.name})"
         }
         return sorted to reason
     }
 
+    private fun resolveAutoFreeCandidates(
+        providers: List<ProviderEntity>,
+        localServers: List<LocalAiServerEntity>,
+        allModels: List<ModelEntity>,
+        allKeys: List<ApiKeyEntity>,
+        settings: GatewaySettingsState,
+        requireVision: Boolean,
+        requiredDocumentMimeTypes: Set<String>,
+        nowMs: Long
+    ): Pair<List<RouteCandidate>, String> {
+        val candidates = mutableListOf<RouteCandidate>()
+
+        for (provider in providers) {
+            if (isProviderCoolingDown(provider, nowMs)) continue
+            val selectedKeys = selectKeysForProvider(allKeys.filter { it.providerId == provider.id })
+            if (selectedKeys.isEmpty()) continue
+            val primaryKey = selectedKeys.firstOrNull { key ->
+                CryptoManager.decryptResult(key.encryptedKey).getOrNull()?.isNotBlank() == true
+            } ?: continue
+            val decryptedKey = CryptoManager.decryptResult(primaryKey.encryptedKey).getOrNull().orEmpty()
+            if (decryptedKey.isBlank()) continue
+
+            val freeModels = allModels.filter { m ->
+                m.providerId == provider.id &&
+                    m.enabled &&
+                    m.supportsChat &&
+                    m.modelType != ModelType.EMBEDDING &&
+                    m.modelType != ModelType.IMAGE_GENERATION &&
+                    m.accessTier == AccessTier.FREE_TIER &&
+                    m.freeTierVerified
+            }
+
+            val adapter = ProviderAdapterRegistry.adapterFor(provider.apiFormat)
+            for (model in freeModels) {
+                val caps = adapter.capabilitiesForModel(model.modelId, model)
+                if (!candidateSupportsAttachments(caps, requireVision, requiredDocumentMimeTypes)) continue
+                candidates += RouteCandidate(
+                    id = provider.id,
+                    displayName = provider.name,
+                    baseUrl = provider.baseUrl,
+                    apiFormat = provider.apiFormat,
+                    apiKey = decryptedKey,
+                    keyEntityId = primaryKey.id,
+                    customHeadersJson = provider.customHeadersJson,
+                    modelId = model.modelId,
+                    isLocal = false,
+                    priority = provider.priority,
+                    lastLatencyMs = provider.lastLatencyMs ?: 5000L,
+                    estimatedCostPer1M = 0.0,
+                    capabilities = caps,
+                    providerStatus = provider.status,
+                    accessTier = model.accessTier,
+                    freeTierVerified = model.freeTierVerified
+                )
+            }
+        }
+
+        if (settings.autoFreeIncludeLocal) {
+            for (srv in localServers) {
+                if (srv.status == ProviderStatus.ERROR || srv.status == ProviderStatus.DISCONNECTED) continue
+                val localKey = "local:${srv.id}"
+                val authToken = if (srv.hasAuth) {
+                    CryptoManager.decryptResult(srv.encryptedAuthToken).getOrNull() ?: continue
+                } else ""
+                val format = if (srv.engineType == LocalEngineType.OLLAMA) ApiFormat.OLLAMA else ApiFormat.OPENAI
+                val adapter = ProviderAdapterRegistry.adapterFor(format)
+                val srvModels = allModels.filter { m ->
+                    m.providerId == localKey &&
+                        m.enabled &&
+                        m.supportsChat &&
+                        m.modelType != ModelType.EMBEDDING &&
+                        m.modelType != ModelType.IMAGE_GENERATION &&
+                        m.accessTier == AccessTier.LOCAL
+                }
+                val modelsToEvaluate = if (srvModels.isNotEmpty()) {
+                    srvModels
+                } else if (srv.defaultModel.isNotBlank()) {
+                    listOf(
+                        ModelEntity(
+                            id = "$localKey::${srv.defaultModel}",
+                            modelId = srv.defaultModel,
+                            displayName = srv.defaultModel,
+                            providerId = localKey,
+                            providerName = srv.name,
+                            isLocal = true,
+                            accessTier = AccessTier.LOCAL
+                        )
+                    )
+                } else emptyList()
+
+                for (model in modelsToEvaluate) {
+                    val caps = adapter.capabilitiesForModel(model.modelId, model)
+                    if (!candidateSupportsAttachments(caps, requireVision, requiredDocumentMimeTypes)) continue
+                    candidates += RouteCandidate(
+                        id = localKey,
+                        displayName = srv.name,
+                        baseUrl = srv.serverUrl,
+                        apiFormat = format,
+                        apiKey = authToken,
+                        keyEntityId = null,
+                        customHeadersJson = "",
+                        modelId = model.modelId,
+                        isLocal = true,
+                        priority = 50,
+                        lastLatencyMs = srv.lastLatencyMs ?: 1000L,
+                        estimatedCostPer1M = 0.0,
+                        capabilities = caps,
+                        providerStatus = srv.status,
+                        accessTier = AccessTier.LOCAL,
+                        freeTierVerified = false
+                    )
+                }
+            }
+        }
+
+        val sorted = candidates.sortedWith(
+            compareBy<RouteCandidate> { healthRank(it.providerStatus) }
+                .thenBy { it.priority }
+                .thenBy { it.lastLatencyMs }
+                .thenBy { it.displayName }
+                .thenBy { it.modelId }
+        )
+        return sorted to "Auto — Verified Free Models"
+    }
+
     private suspend fun diagnoseNoCandidates(
         requestedModelOrAlias: String,
         settings: GatewaySettingsState,
-        explicitProviderId: String?
+        mode: RoutingMode,
+        explicitProviderId: String?,
+        requireVision: Boolean = false,
+        requiredDocumentMimeTypes: Set<String> = emptySet()
     ): String {
         val enabledProviders = db.providerDao().getAllOnce().filter { it.enabled }
         val enabledLocal = db.localAiServerDao().getAllOnce().filter { it.enabled }
         val allKeys = db.apiKeyDao().getAllOnce().filter { it.enabled }
+
+        if (mode == RoutingMode.AUTO_FREE && explicitProviderId == null) {
+            if (requireVision || requiredDocumentMimeTypes.isNotEmpty()) {
+                val (unfiltered, _) = resolveCandidates(
+                    requestedModelOrAlias = "",
+                    settings = settings,
+                    mode = RoutingMode.AUTO_FREE,
+                    explicitProviderId = null,
+                    requireVision = false,
+                    requiredDocumentMimeTypes = emptySet()
+                )
+                if (unfiltered.isNotEmpty()) {
+                    return "No verified free models support the attached image or document type."
+                }
+            }
+            return "No verified free models available. Configure a free-tier provider, confirm free access in Models, or pick a specific model."
+        }
 
         if (enabledProviders.isEmpty() && enabledLocal.isEmpty()) {
             return "No enabled provider or local AI server available. Enable or add a provider first."

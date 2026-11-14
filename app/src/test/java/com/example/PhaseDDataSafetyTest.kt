@@ -91,7 +91,7 @@ class PhaseDDataSafetyTest {
             .build()
         try {
             val sqlite = migratedDb.openHelper.writableDatabase
-            assertEquals(4, sqlite.version)
+            assertEquals(5, sqlite.version)
 
             // Verify all expected Phase D indexes exist
             val indexNames = mutableSetOf<String>()
@@ -231,7 +231,7 @@ class PhaseDDataSafetyTest {
 
         val preview = backupManager.previewEncryptedBackup(archive, passphrase)
         assertEquals(2, preview.formatVersion)
-        assertEquals(4, preview.schemaVersion)
+        assertEquals(5, preview.schemaVersion)
         assertEquals(150_000, preview.kdfIterations)
         assertTrue(preview.integrityVerified)
         assertEquals(0, preview.conflicts.totalConflicts)

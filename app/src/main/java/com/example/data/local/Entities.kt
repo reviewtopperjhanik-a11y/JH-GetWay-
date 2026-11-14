@@ -57,6 +57,13 @@ enum class ModelType {
     GENERAL_CHAT, CODING, REASONING, VISION, IMAGE_GENERATION, EMBEDDING, AUDIO, MULTIMODAL, CUSTOM
 }
 
+enum class AccessTier {
+    FREE_TIER,
+    PAID,
+    LOCAL,
+    UNKNOWN
+}
+
 @Entity(
     tableName = "models",
     indices = [Index(value = ["providerId"]), Index(value = ["modelId"])]
@@ -79,7 +86,14 @@ data class ModelEntity(
     val enabled: Boolean = true,
     val isDefault: Boolean = false,
     val alias: String = "",
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    val accessTier: AccessTier = if (isLocal) AccessTier.LOCAL else AccessTier.UNKNOWN,
+    val freeTierVerified: Boolean = false,
+    val freeTierSource: String = "",
+    val freeTierVerifiedAt: Long? = null,
+    val freeTierLimitsNote: String = "",
+    val supportsChat: Boolean = true,
+    val supportsVision: Boolean = false
 )
 
 @Entity(tableName = "routing_rules")
@@ -321,5 +335,6 @@ data class PlaygroundMessageEntity(
     val outputTokens: Int? = null,
     val estimatedCostUsd: Double? = null,
     val isError: Boolean = false,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val attachmentsMetadataJson: String = "[]"
 )

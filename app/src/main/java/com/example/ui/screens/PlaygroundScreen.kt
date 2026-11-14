@@ -2,28 +2,56 @@
 
 package com.example.ui.screens
 
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.MediaStore
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.core.i18n.AppStrings
 import com.example.core.i18n.LocalStrings
-import com.example.data.local.ModelEntity
+import com.example.data.local.*
 import com.example.ui.GatewayViewModel
 import com.example.ui.components.*
 import com.example.ui.navigation.Routes
 import com.example.ui.theme.MonoTextStyle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 
 @Composable
 fun PlaygroundScreen(
@@ -31,36 +59,51 @@ fun PlaygroundScreen(
     onNavigate: (String) -> Unit
 ) {
     val s = LocalStrings.current
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+
     val settings by viewModel.settings.collectAsState()
     val providers by viewModel.providers.collectAsState()
     val localServers by viewModel.localServers.collectAsState()
     val models by viewModel.models.collectAsState()
+    val eligibleFreeCount by viewModel.eligibleAutoFreeCount.collectAsState()
     val playgroundTarget by viewModel.playgroundTarget.collectAsState()
     val sessions by viewModel.playgroundSessions.collectAsState()
+    val activeSessionId by viewModel.activeSessionId.collectAsState()
     val savedMessages by viewModel.activeSessionMessages.collectAsState()
     val ephemeralMessages by viewModel.ephemeralMessages.collectAsState()
     val streamingBuffer by viewModel.streamingBuffer.collectAsState()
     val isStreaming by viewModel.isStreaming.collectAsState()
     val compareResults by viewModel.compareResults.collectAsState()
     val isComparing by viewModel.isComparing.collectAsState()
-    val clipboard = LocalClipboardManager.current
 
     val messages = if (settings.saveChatHistoryAllowed) savedMessages else ephemeralMessages
 
-    var compareMode by remember { mutableStateOf(false) }
-    var selectedProviderId by remember { mutableStateOf<String?>(null) }
-    var selectedModelId by remember { mutableStateOf("") }
-    var customModelDialogVisible by remember { mutableStateOf(false) }
-    var systemPrompt by remember { mutableStateOf("") }
-    var promptInput by remember { mutableStateOf("") }
-    var showParams by remember { mutableStateOf(false) }
+    var compareMode by rememberSaveable { mutableStateOf(false) }
+    var isAutoMode by rememberSaveable { mutableStateOf(true) }
+    var selectedProviderId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedModelId by rememberSaveable { mutableStateOf("") }
+    var systemPrompt by rememberSaveable { mutableStateOf("") }
+    var promptInput by rememberSaveable { mutableStateOf("") }
+    var pendingAttachments by remember { mutableStateOf<List<PendingAttachment>>(emptyList()) }
+    var inlineError by remember { mutableStateOf<String?>(null) }
+    var pendingCameraPath by rememberSaveable { mutableStateOf<String?>(null) }
 
-    var temperature by remember { mutableFloatStateOf(0.7f) }
-    var topP by remember { mutableFloatStateOf(0.95f) }
-    var maxTokensText by remember { mutableStateOf("1024") }
-    var stopSeqText by remember { mutableStateOf("") }
-    var streamingEnabled by remember { mutableStateOf(true) }
-    var jsonOutput by remember { mutableStateOf(false) }
+    var showAttachSheet by remember { mutableStateOf(false) }
+    var showModelSheet by remember { mutableStateOf(false) }
+    var showHistorySheet by remember { mutableStateOf(false) }
+    var showParamsSheet by remember { mutableStateOf(false) }
+    var customModelDialogVisible by remember { mutableStateOf(false) }
+    var showMoreMenu by remember { mutableStateOf(false) }
+
+    var temperature by rememberSaveable { mutableFloatStateOf(0.7f) }
+    var topP by rememberSaveable { mutableFloatStateOf(0.95f) }
+    var maxTokensText by rememberSaveable { mutableStateOf("1024") }
+    var stopSeqText by rememberSaveable { mutableStateOf("") }
+    var streamingEnabled by rememberSaveable { mutableStateOf(true) }
+    var jsonOutput by rememberSaveable { mutableStateOf(false) }
+    var compareSelection by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     val enabledProviderIds = remember(providers, localServers) {
         buildSet {
@@ -69,269 +112,234 @@ fun PlaygroundScreen(
         }
     }
 
-    val eligibleModels = remember(models, providers, localServers, selectedProviderId, enabledProviderIds) {
-        val dbFiltered = models.filter { m ->
-            m.enabled &&
-                m.providerId in enabledProviderIds &&
-                (selectedProviderId == null || m.providerId == selectedProviderId)
-        }.toMutableList()
-
-        // Ensure enabled providers/local servers with a defaultModel appear even before catalog fetch
-        if (selectedProviderId == null) {
-            providers.filter { it.enabled && it.defaultModel.isNotBlank() }.forEach { p ->
-                if (dbFiltered.none { it.providerId == p.id && it.modelId.equals(p.defaultModel, true) }) {
-                    dbFiltered += ModelEntity(
-                        id = "${p.id}::${p.defaultModel}",
-                        modelId = p.defaultModel,
-                        displayName = p.defaultModel,
-                        providerId = p.id,
-                        providerName = p.name,
-                        isLocal = false,
-                        isDefault = settings.defaultModelId.equals(p.defaultModel, true)
-                    )
-                }
-            }
-            localServers.filter { it.enabled && it.defaultModel.isNotBlank() }.forEach { srv ->
-                val lid = "local:${srv.id}"
-                if (dbFiltered.none { it.providerId == lid && it.modelId.equals(srv.defaultModel, true) }) {
-                    dbFiltered += ModelEntity(
-                        id = "$lid::${srv.defaultModel}",
-                        modelId = srv.defaultModel,
-                        displayName = srv.defaultModel,
-                        providerId = lid,
-                        providerName = srv.name,
-                        isLocal = true
-                    )
-                }
-            }
-        } else if (selectedProviderId!!.startsWith("local:")) {
-            val srv = localServers.firstOrNull { "local:${it.id}" == selectedProviderId && it.enabled }
-            if (srv != null && srv.defaultModel.isNotBlank() &&
-                dbFiltered.none { it.modelId.equals(srv.defaultModel, true) }
-            ) {
-                dbFiltered.add(
-                    0,
-                    ModelEntity(
-                        id = "${selectedProviderId}::${srv.defaultModel}",
-                        modelId = srv.defaultModel,
-                        displayName = srv.defaultModel,
-                        providerId = selectedProviderId!!,
-                        providerName = srv.name,
-                        isLocal = true
-                    )
-                )
-            }
-        } else {
-            val prov = providers.firstOrNull { it.id == selectedProviderId && it.enabled }
-            if (prov != null && prov.defaultModel.isNotBlank() &&
-                dbFiltered.none { it.modelId.equals(prov.defaultModel, true) }
-            ) {
-                dbFiltered.add(
-                    0,
-                    ModelEntity(
-                        id = "${prov.id}::${prov.defaultModel}",
-                        modelId = prov.defaultModel,
-                        displayName = prov.defaultModel,
-                        providerId = prov.id,
-                        providerName = prov.name,
-                        isLocal = false
-                    )
-                )
-            }
-        }
-        dbFiltered
-    }
-
     LaunchedEffect(playgroundTarget) {
         val target = playgroundTarget
         if (target != null) {
+            isAutoMode = false
             selectedProviderId = target.providerId?.takeIf { it in enabledProviderIds }
             selectedModelId = target.modelId
             viewModel.consumePlaygroundTarget()
         }
     }
 
-    LaunchedEffect(selectedProviderId, eligibleModels, settings.defaultModelId) {
-        if (selectedProviderId != null && selectedProviderId !in enabledProviderIds) {
+    LaunchedEffect(selectedProviderId, enabledProviderIds) {
+        if (!isAutoMode && selectedProviderId != null && selectedProviderId !in enabledProviderIds) {
+            isAutoMode = true
             selectedProviderId = null
+            selectedModelId = ""
         }
-        val currentIsEligible = selectedModelId.isNotBlank() && (
-            selectedProviderId == null ||
-                eligibleModels.any { it.modelId.equals(selectedModelId, ignoreCase = true) }
-            )
-        if (!currentIsEligible) {
-            selectedModelId = when {
-                selectedProviderId != null -> {
-                    val provDef = providers.firstOrNull { it.id == selectedProviderId }?.defaultModel.orEmpty()
-                    val srvDef = localServers.firstOrNull { "local:${it.id}" == selectedProviderId }?.defaultModel.orEmpty()
-                    provDef.ifBlank { srvDef }.ifBlank {
-                        eligibleModels.firstOrNull { it.isDefault }?.modelId
-                            ?: eligibleModels.firstOrNull()?.modelId.orEmpty()
+    }
+
+    val selectedModelEntity = remember(models, selectedProviderId, selectedModelId) {
+        models.firstOrNull {
+            (selectedProviderId == null || it.providerId == selectedProviderId) &&
+                it.modelId.equals(selectedModelId, ignoreCase = true)
+        }
+    }
+
+    fun mapImportErrorMessage(err: AttachmentImportError): String = when (err) {
+        AttachmentImportError.UNSUPPORTED_TYPE -> s.unsupportedFileTypeError
+        AttachmentImportError.FILE_TOO_LARGE -> s.fileTooLargeError
+        AttachmentImportError.LIMIT_EXCEEDED -> s.attachmentLimitError
+        AttachmentImportError.READ_FAILED -> s.attachmentReadError
+    }
+
+    fun handleImportedUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        scope.launch {
+            var currentList = pendingAttachments
+            var firstErr: String? = null
+            for (uri in uris) {
+                val res = withContext(Dispatchers.IO) {
+                    PlaygroundAttachmentManager.importPickedUri(
+                        context = context,
+                        uri = uri,
+                        saveHistory = settings.saveChatHistoryAllowed,
+                        existingCount = currentList.size,
+                        existingTotalBytes = currentList.sumOf { it.sizeBytes }
+                    )
+                }
+                when (res) {
+                    is AttachmentImportResult.Success -> currentList = currentList + res.attachment
+                    is AttachmentImportResult.Error -> {
+                        if (firstErr == null) firstErr = mapImportErrorMessage(res.reason)
                     }
                 }
-                settings.defaultModelId.isNotBlank() -> settings.defaultModelId
-                else -> eligibleModels.firstOrNull { it.isDefault }?.modelId
-                    ?: eligibleModels.firstOrNull()?.modelId.orEmpty()
+            }
+            pendingAttachments = currentList
+            inlineError = firstErr
+        }
+    }
+
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { captured ->
+        val camFile = pendingCameraPath?.let { File(it) }
+        pendingCameraPath = null
+        if (!captured || camFile == null) {
+            camFile?.let { runCatching { it.delete() } }
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            val res = withContext(Dispatchers.IO) {
+                PlaygroundAttachmentManager.importCameraFile(
+                    context = context,
+                    sourceFile = camFile,
+                    saveHistory = settings.saveChatHistoryAllowed,
+                    existingCount = pendingAttachments.size,
+                    existingTotalBytes = pendingAttachments.sumOf { it.sizeBytes }
+                )
+            }
+            when (res) {
+                is AttachmentImportResult.Success -> {
+                    pendingAttachments = pendingAttachments + res.attachment
+                    inlineError = null
+                }
+                is AttachmentImportResult.Error -> {
+                    inlineError = mapImportErrorMessage(res.reason)
+                }
             }
         }
     }
 
-    val selectedModelEntity = eligibleModels.firstOrNull { it.modelId == selectedModelId }
-        ?: models.firstOrNull { it.modelId == selectedModelId }
-    var compareSelection by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val photosLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(PlaygroundAttachmentManager.MAX_ATTACHMENTS)
+    ) { uris ->
+        handleImportedUris(uris)
+    }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        // Mode & Actions Header
-        FlowRow(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
+    val filesLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        handleImportedUris(uris)
+    }
+
+    val listState = rememberLazyListState()
+    LaunchedEffect(messages.size, streamingBuffer.length, isStreaming) {
+        val totalItems = messages.size + if (isStreaming) 1 else 0
+        if (!compareMode && totalItems > 0) {
+            listState.animateScrollToItem(totalItems - 1)
+        }
+    }
+
+    fun dispatchChatSend(promptText: String, attachmentsToSend: List<PendingAttachment>) {
+        inlineError = null
+        viewModel.sendPlaygroundPrompt(
+            prompt = promptText,
+            systemPrompt = systemPrompt,
+            modelIdOrAlias = selectedModelId,
+            explicitProviderId = selectedProviderId,
+            temperature = temperature,
+            topP = topP,
+            maxTokens = maxTokensText.toIntOrNull() ?: 1024,
+            stopSequences = stopSeqText.split(",").map { it.trim() }.filter { it.isNotBlank() },
+            jsonOutput = jsonOutput,
+            streaming = streamingEnabled,
+            isAutoMode = isAutoMode,
+            attachments = attachmentsToSend,
+            onRequestAccepted = {
+                if (attachmentsToSend == pendingAttachments) {
+                    pendingAttachments = emptyList()
+                }
+                if (promptText == promptInput) {
+                    promptInput = ""
+                }
+            },
+            onValidationError = { err ->
+                inlineError = err
+            }
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+    ) {
+        // Compact Top Utility Bar (no Provider/Model LazyRows)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 FilterChip(
                     selected = !compareMode,
                     onClick = { compareMode = false },
-                    label = { Text(s.singleChatMode) },
+                    label = { Text(s.singleChatMode, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     modifier = Modifier.testTag("playground_chat_mode")
                 )
                 FilterChip(
                     selected = compareMode,
                     onClick = { compareMode = true },
-                    label = { Text(s.multiModelCompareMode) },
+                    label = { Text(s.multiModelCompareMode, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     modifier = Modifier.testTag("playground_compare_mode")
                 )
             }
-            Row {
-                IconButton(onClick = { showParams = !showParams }) {
-                    Icon(Icons.Default.Tune, contentDescription = s.parameters)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(
+                    onClick = { showHistorySheet = true },
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("playground_history_btn")
+                ) {
+                    Icon(Icons.Default.History, contentDescription = s.sessionHistory)
                 }
-                IconButton(onClick = { viewModel.selectOrCreateSession(null) }) {
+                IconButton(
+                    onClick = { viewModel.selectOrCreateSession(null) },
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("playground_new_chat_btn")
+                ) {
                     Icon(Icons.Default.AddComment, contentDescription = s.newChat)
                 }
-                IconButton(onClick = { viewModel.clearActiveChat() }) {
-                    Icon(Icons.Default.DeleteSweep, contentDescription = s.clearChat)
-                }
-                IconButton(onClick = {
-                    val exported = messages.joinToString("\n\n") { "[${it.role.uppercase()}] ${it.content}" }
-                    clipboard.setText(AnnotatedString(exported))
-                    viewModel.postBanner(s.copied)
-                }) {
-                    Icon(Icons.Default.IosShare, contentDescription = s.exportChat)
-                }
-            }
-        }
-
-        // Provider & Model Selector Bar
-        LazyRow(
-            contentPadding = PaddingValues(horizontal = 16.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            item {
-                FilterChip(
-                    selected = selectedProviderId == null,
-                    onClick = { selectedProviderId = null },
-                    label = { Text(s.autoRouterLabel) },
-                    modifier = Modifier.testTag("playground_provider_auto")
-                )
-            }
-            items(providers.filter { it.enabled }, key = { it.id }) { p ->
-                FilterChip(
-                    selected = selectedProviderId == p.id,
-                    onClick = {
-                        selectedProviderId = p.id
-                        val preferred = p.defaultModel.ifBlank {
-                            models.firstOrNull { it.providerId == p.id && it.enabled && it.isDefault }?.modelId
-                                ?: models.firstOrNull { it.providerId == p.id && it.enabled }?.modelId.orEmpty()
-                        }
-                        if (preferred.isNotBlank()) selectedModelId = preferred
-                    },
-                    label = { Text(p.name) },
-                    modifier = Modifier.testTag("playground_provider_${p.id}")
-                )
-            }
-            items(localServers.filter { it.enabled }, key = { "local:${it.id}" }) { srv ->
-                val lid = "local:${srv.id}"
-                FilterChip(
-                    selected = selectedProviderId == lid,
-                    onClick = {
-                        selectedProviderId = lid
-                        val preferred = srv.defaultModel.ifBlank {
-                            models.firstOrNull { it.providerId == lid && it.enabled }?.modelId.orEmpty()
-                        }
-                        if (preferred.isNotBlank()) selectedModelId = preferred
-                    },
-                    label = { Text("${srv.name} (${s.localModels})") },
-                    modifier = Modifier.testTag("playground_provider_$lid")
-                )
-            }
-        }
-
-        if (!compareMode && (eligibleModels.isNotEmpty() || enabledProviderIds.isNotEmpty())) {
-            LazyRow(
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                items(eligibleModels, key = { it.id }) { m ->
-                    val label = when {
-                        m.alias.isNotBlank() -> "${m.alias} (${m.modelId})"
-                        selectedProviderId == null -> "${m.providerName}: ${m.modelId}"
-                        else -> m.modelId
+                Box {
+                    IconButton(
+                        onClick = { showMoreMenu = true },
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("playground_more_btn")
+                    ) {
+                        Icon(Icons.Default.MoreVert, contentDescription = s.settingsTitle)
                     }
-                    FilterChip(
-                        selected = selectedModelId.equals(m.modelId, ignoreCase = true),
-                        onClick = { selectedModelId = m.modelId },
-                        label = { Text(label, style = MonoTextStyle) },
-                        modifier = Modifier.testTag("playground_model_${m.modelId}")
-                    )
-                }
-                item {
-                    AssistChip(
-                        onClick = { customModelDialogVisible = true },
-                        label = { Text(if (selectedModelId.isBlank()) s.modelOrAliasLabel else "${s.edit}: $selectedModelId", style = MonoTextStyle) },
-                        leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp)) },
-                        modifier = Modifier.testTag("playground_custom_model_btn")
-                    )
-                }
-            }
-        }
-
-        if (showParams) {
-            GatewayCard(modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
-                OutlinedTextField(
-                    value = systemPrompt,
-                    onValueChange = { systemPrompt = it },
-                    label = { Text(s.systemPromptLabel) },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(6.dp))
-                Text("${s.temperature}: ${String.format("%.2f", temperature)}", style = MaterialTheme.typography.labelMedium)
-                Slider(value = temperature, onValueChange = { temperature = it }, valueRange = 0f..2f)
-                Text("${s.topP}: ${String.format("%.2f", topP)}", style = MaterialTheme.typography.labelMedium)
-                Slider(value = topP, onValueChange = { topP = it }, valueRange = 0.05f..1f)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(value = maxTokensText, onValueChange = { maxTokensText = it.filter { c -> c.isDigit() } }, label = { Text(s.maxOutputTokens) }, singleLine = true, modifier = Modifier.weight(1f))
-                    OutlinedTextField(value = stopSeqText, onValueChange = { stopSeqText = it }, label = { Text(s.stopSequences) }, singleLine = true, modifier = Modifier.weight(1f))
-                }
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    val streamSupported = selectedModelEntity?.supportsStreaming ?: true
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Switch(checked = streamingEnabled && streamSupported, enabled = streamSupported, onCheckedChange = { streamingEnabled = it })
-                        Spacer(Modifier.width(4.dp))
-                        Text(if (streamSupported) s.streamingLabel else "${s.streamingLabel} (${s.unsupportedParam})", style = MaterialTheme.typography.bodySmall)
+                    DropdownMenu(
+                        expanded = showMoreMenu,
+                        onDismissRequest = { showMoreMenu = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text(s.parameters) },
+                            leadingIcon = { Icon(Icons.Default.Tune, contentDescription = null) },
+                            onClick = { showMoreMenu = false; showParamsSheet = true }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(s.clearChat) },
+                            leadingIcon = { Icon(Icons.Default.DeleteSweep, contentDescription = null) },
+                            onClick = { showMoreMenu = false; viewModel.clearActiveChat() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(s.exportChat) },
+                            leadingIcon = { Icon(Icons.Default.IosShare, contentDescription = null) },
+                            onClick = {
+                                showMoreMenu = false
+                                val exported = messages.joinToString("\n\n") { "[${it.role.uppercase()}] ${it.content}" }
+                                clipboard.setText(AnnotatedString(exported))
+                                viewModel.postBanner(s.copied)
+                            }
+                        )
                     }
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    val jsonSupported = !selectedModelId.contains("cohere", true)
-                    Switch(checked = jsonOutput && jsonSupported, enabled = jsonSupported, onCheckedChange = { jsonOutput = it })
-                    Spacer(Modifier.width(4.dp))
-                    Text(if (jsonSupported) s.jsonOutput else "${s.jsonOutput} (${s.unsupportedParam})", style = MaterialTheme.typography.bodySmall)
-                }
             }
         }
 
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+        // Main Chat / Empty / Compare Area
         if (providers.none { it.enabled } && localServers.none { it.enabled }) {
-            Box(modifier = Modifier.weight(1f).padding(16.dp), contentAlignment = Alignment.Center) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                contentAlignment = Alignment.Center
+            ) {
                 EmptyStatePanel(
                     icon = Icons.AutoMirrored.Filled.Chat,
                     title = s.noProvidersTitle,
@@ -341,77 +349,229 @@ fun PlaygroundScreen(
                 )
             }
         } else if (!compareMode) {
-            // Single Chat Conversation Area
-            if (sessions.isNotEmpty() && settings.saveChatHistoryAllowed) {
-                LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(sessions.take(5), key = { it.id }) { sess ->
-                        AssistChip(
-                            onClick = { viewModel.selectOrCreateSession(sess.id) },
-                            label = { Text(sess.title, maxLines = 1) }
-                        )
-                    }
-                }
-            }
-
-            LazyColumn(
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                items(messages, key = { it.id }) { msg ->
-                    val isUser = msg.role == "user"
-                    GatewayCard(
-                        containerColor = when {
-                            msg.isError -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
-                            isUser -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
-                            else -> MaterialTheme.colorScheme.surface
-                        }
+            if (messages.isEmpty() && !isStreaming) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = if (isUser) s.youLabel else "${msg.providerName} • ${msg.modelId}",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                            IconButton(
-                                onClick = {
-                                    clipboard.setText(AnnotatedString(msg.content))
-                                    viewModel.postBanner(s.copied)
-                                },
-                                modifier = Modifier
-                                    .minimumInteractiveComponentSize()
-                                    .testTag("playground_copy_msg_${msg.id}")
+                        Icon(
+                            imageVector = Icons.Default.AutoAwesome,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(36.dp)
+                        )
+                        Text(s.emptyChatTitle, style = MaterialTheme.typography.headlineSmall)
+                        Text(
+                            text = s.emptyChatSubtitle,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (isAutoMode && eligibleFreeCount == 0) {
+                            Spacer(Modifier.height(4.dp))
+                            Surface(
+                                shape = RoundedCornerShape(14.dp),
+                                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f),
+                                modifier = Modifier.fillMaxWidth()
                             ) {
-                                Icon(Icons.Default.ContentCopy, contentDescription = s.copyResponseLabel, modifier = Modifier.size(18.dp))
+                                Column(
+                                    modifier = Modifier.padding(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(s.noEligibleFreeModels, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.error)
+                                    Text(s.noEligibleFreeModelsHint, style = MaterialTheme.typography.bodySmall)
+                                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        OutlinedButton(onClick = { onNavigate(Routes.PROVIDERS) }) {
+                                            Text(s.reviewProvidersLabel)
+                                        }
+                                        OutlinedButton(onClick = { onNavigate(Routes.MODELS) }) {
+                                            Text(s.reviewModelsLabel)
+                                        }
+                                    }
+                                }
                             }
-                        }
-                        Spacer(Modifier.height(4.dp))
-                        Text(msg.content, style = MaterialTheme.typography.bodyMedium)
-                        if (!isUser && msg.latencyMs != null) {
-                            Spacer(Modifier.height(6.dp))
-                            Text(
-                                text = "${msg.latencyMs}ms • ${msg.inputTokens ?: 0} in / ${msg.outputTokens ?: 0} out • ${formatCurrency(msg.estimatedCostUsd, settings.analyticsCurrency, s.unknown)}",
-                                style = MonoTextStyle,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
                         }
                     }
                 }
-
-                if (isStreaming) {
-                    item {
-                        GatewayCard {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                                Text(s.streamingIndicator, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            } else {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    items(messages, key = { it.id }) { msg ->
+                        val isUser = msg.role == "user"
+                        val isLastAssistant = !isUser && msg.id == messages.lastOrNull { it.role != "user" }?.id
+                        if (isUser) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalAlignment = Alignment.End
+                            ) {
+                                Surface(
+                                    shape = RoundedCornerShape(18.dp),
+                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.8f),
+                                    modifier = Modifier.widthIn(max = 310.dp)
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        val attachedMeta = remember(msg.attachmentsMetadataJson) {
+                                            PlaygroundAttachmentManager.parseMetadataJson(msg.attachmentsMetadataJson)
+                                        }
+                                        if (attachedMeta.isNotEmpty()) {
+                                            FlowRow(
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                attachedMeta.forEach { meta ->
+                                                    Surface(
+                                                        shape = RoundedCornerShape(8.dp),
+                                                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)
+                                                    ) {
+                                                        Row(
+                                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                                            verticalAlignment = Alignment.CenterVertically,
+                                                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                                        ) {
+                                                            Icon(
+                                                                imageVector = if (meta.category == AttachmentCategory.IMAGE) {
+                                                                    Icons.Default.Image
+                                                                } else Icons.Default.Description,
+                                                                contentDescription = null,
+                                                                modifier = Modifier.size(14.dp)
+                                                            )
+                                                            Text(
+                                                                text = meta.displayName,
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                maxLines = 1,
+                                                                overflow = TextOverflow.Ellipsis
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (msg.content.isNotBlank()) {
+                                            Text(msg.content, style = MaterialTheme.typography.bodyLarge)
+                                        }
+                                    }
+                                }
                             }
-                            if (streamingBuffer.isNotBlank()) {
-                                Spacer(Modifier.height(6.dp))
-                                Text(streamingBuffer, style = MaterialTheme.typography.bodyMedium)
+                        } else {
+                            // Clean ChatGPT-style flat assistant block
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 2.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                val headerTitle = buildString {
+                                    if (msg.providerName.isNotBlank()) append(msg.providerName)
+                                    if (msg.modelId.isNotBlank()) {
+                                        if (isNotEmpty()) append(" • ")
+                                        append(msg.modelId)
+                                    }
+                                }.ifBlank { s.autoShortLabel }
+                                Text(
+                                    text = headerTitle,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (msg.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = msg.content,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = if (msg.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    if (msg.latencyMs != null) {
+                                        Text(
+                                            text = "${msg.latencyMs}ms • ${msg.inputTokens ?: 0}/${msg.outputTokens ?: 0} • ${formatCurrency(msg.estimatedCostUsd, settings.analyticsCurrency, s.unknown)}",
+                                            style = MonoTextStyle,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                    } else {
+                                        Spacer(Modifier.weight(1f))
+                                    }
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        IconButton(
+                                            onClick = {
+                                                clipboard.setText(AnnotatedString(msg.content))
+                                                viewModel.postBanner(s.copied)
+                                            },
+                                            modifier = Modifier
+                                                .minimumInteractiveComponentSize()
+                                                .testTag("playground_copy_msg_${msg.id}")
+                                        ) {
+                                            Icon(
+                                                Icons.Default.ContentCopy,
+                                                contentDescription = s.copyResponseLabel,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                        if (isLastAssistant && !isStreaming) {
+                                            val lastUser = messages.lastOrNull { it.role == "user" }
+                                            if (lastUser != null && lastUser.content.isNotBlank()) {
+                                                IconButton(
+                                                    onClick = { dispatchChatSend(lastUser.content, emptyList()) },
+                                                    modifier = Modifier
+                                                        .minimumInteractiveComponentSize()
+                                                        .testTag("playground_regenerate_btn")
+                                                ) {
+                                                    Icon(
+                                                        Icons.Default.Refresh,
+                                                        contentDescription = s.regenerate,
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (isStreaming) {
+                        item(key = "streaming_indicator") {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                    Text(
+                                        text = s.streamingIndicator,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                if (streamingBuffer.isNotBlank()) {
+                                    Text(streamingBuffer, style = MaterialTheme.typography.bodyLarge)
+                                }
                             }
                         }
                     }
@@ -420,7 +580,9 @@ fun PlaygroundScreen(
         } else {
             // Multi-Model Compare Mode
             LazyColumn(
-                modifier = Modifier.weight(1f).fillMaxWidth(),
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
@@ -440,13 +602,9 @@ fun PlaygroundScreen(
                         }
                     }
                 }
-
                 if (isComparing) {
-                    item {
-                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                    }
+                    item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) }
                 }
-
                 items(compareResults) { itemRes ->
                     GatewayCard {
                         Row(
@@ -477,70 +635,344 @@ fun PlaygroundScreen(
             }
         }
 
-        // Input Composer Bar
-        Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
-            Row(
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+        // Inline Error Banner above Composer
+        inlineError?.let { errMsg ->
+            Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
+                    .testTag("playground_inline_error"),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                OutlinedTextField(
-                    value = promptInput,
-                    onValueChange = { promptInput = it },
-                    placeholder = { Text(s.messageInputHint) },
-                    maxLines = 4,
-                    modifier = Modifier.weight(1f).testTag("playground_prompt_input")
-                )
-                if (!compareMode && messages.lastOrNull { it.role == "user" } != null && !isStreaming) {
-                    IconButton(onClick = {
-                        val lastUser = messages.lastOrNull { it.role == "user" }?.content.orEmpty()
-                        if (lastUser.isNotBlank()) {
-                            viewModel.sendPlaygroundPrompt(
-                                prompt = lastUser,
-                                systemPrompt = systemPrompt,
-                                modelIdOrAlias = selectedModelId,
-                                explicitProviderId = selectedProviderId,
-                                temperature = temperature,
-                                topP = topP,
-                                maxTokens = maxTokensText.toIntOrNull() ?: 1024,
-                                stopSequences = stopSeqText.split(",").map { it.trim() }.filter { it.isNotBlank() },
-                                jsonOutput = jsonOutput,
-                                streaming = streamingEnabled
-                            )
-                        }
-                    }) {
-                        Icon(Icons.Default.Refresh, contentDescription = s.regenerate)
-                    }
-                }
-                FilledIconButton(
-                    enabled = promptInput.isNotBlank() && !isStreaming && !isComparing,
-                    onClick = {
-                        val currentPrompt = promptInput
-                        promptInput = ""
-                        if (compareMode) {
-                            val chosen = models.filter { it.id in compareSelection }
-                            viewModel.runModelComparison(currentPrompt, systemPrompt, chosen)
-                        } else {
-                            viewModel.sendPlaygroundPrompt(
-                                prompt = currentPrompt,
-                                systemPrompt = systemPrompt,
-                                modelIdOrAlias = selectedModelId,
-                                explicitProviderId = selectedProviderId,
-                                temperature = temperature,
-                                topP = topP,
-                                maxTokens = maxTokensText.toIntOrNull() ?: 1024,
-                                stopSequences = stopSeqText.split(",").map { it.trim() }.filter { it.isNotBlank() },
-                                jsonOutput = jsonOutput,
-                                streaming = streamingEnabled
-                            )
-                        }
-                    },
-                    modifier = Modifier.size(48.dp).testTag("playground_send_btn")
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = s.send)
+                    Icon(Icons.Default.WarningAmber, contentDescription = null, tint = MaterialTheme.colorScheme.onErrorContainer, modifier = Modifier.size(18.dp))
+                    Text(
+                        text = errMsg,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(
+                        onClick = { inlineError = null },
+                        modifier = Modifier.minimumInteractiveComponentSize()
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = s.close, tint = MaterialTheme.colorScheme.onErrorContainer)
+                    }
                 }
             }
         }
+
+        // ChatGPT-Style Bottom Rounded Composer
+        Surface(
+            shape = RoundedCornerShape(24.dp),
+            tonalElevation = 3.dp,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (pendingAttachments.isNotEmpty()) {
+                    AttachmentPreviewStrip(
+                        attachments = pendingAttachments,
+                        s = s,
+                        onRemove = { att ->
+                            pendingAttachments = pendingAttachments.filterNot { it.id == att.id }
+                            PlaygroundAttachmentManager.deleteFileIfOwned(context, att.localFilePath)
+                        }
+                    )
+                    Text(
+                        text = s.cloudUploadDisclosure,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 6.dp)
+                    )
+                }
+
+                // Composer Row 1: [+]  [Expanding Multiline Input]  [Send / Stop]
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (!compareMode) {
+                        IconButton(
+                            onClick = { showAttachSheet = true },
+                            enabled = !isStreaming,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("playground_plus_btn")
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = s.attachActionDesc)
+                        }
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 44.dp, max = 140.dp)
+                            .padding(vertical = 10.dp, horizontal = 4.dp),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        if (promptInput.isEmpty()) {
+                            Text(
+                                text = s.messageInputHint,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        BasicTextField(
+                            value = promptInput,
+                            onValueChange = { promptInput = it },
+                            textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+                            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                            maxLines = 5,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("playground_prompt_input")
+                        )
+                    }
+
+                    if (isStreaming) {
+                        FilledIconButton(
+                            onClick = { viewModel.stopPlaygroundStreaming() },
+                            colors = IconButtonDefaults.filledIconButtonColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer,
+                                contentColor = MaterialTheme.colorScheme.onErrorContainer
+                            ),
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("playground_stop_btn")
+                        ) {
+                            Icon(Icons.Default.Stop, contentDescription = s.stopGenerating)
+                        }
+                    } else {
+                        FilledIconButton(
+                            enabled = !isComparing,
+                            onClick = {
+                                if (promptInput.isBlank() && pendingAttachments.isEmpty()) {
+                                    inlineError = s.emptyPromptError
+                                    return@FilledIconButton
+                                }
+                                if (compareMode) {
+                                    val chosen = models.filter { it.id in compareSelection }
+                                    val textToCompare = promptInput
+                                    promptInput = ""
+                                    viewModel.runModelComparison(textToCompare, systemPrompt, chosen)
+                                } else {
+                                    dispatchChatSend(promptInput, pendingAttachments)
+                                }
+                            },
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("playground_send_btn")
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = s.send)
+                        }
+                    }
+                }
+
+                // Composer Row 2: [Model Selector Chip (Auto ▾ / model ▾)]  [attachment count / Params]
+                if (!compareMode) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        val chipText = if (isAutoMode || selectedModelId.isBlank()) {
+                            s.autoShortLabel
+                        } else {
+                            selectedModelEntity?.displayName?.ifBlank { selectedModelId } ?: selectedModelId
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .widthIn(max = 220.dp)
+                                .clip(RoundedCornerShape(16.dp))
+                                .clickable { showModelSheet = true }
+                                .testTag("playground_model_selector_chip")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (isAutoMode) Icons.Default.AutoAwesome else Icons.Default.Memory,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(15.dp),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    text = chipText,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false)
+                                )
+                                Icon(
+                                    imageVector = Icons.Default.KeyboardArrowDown,
+                                    contentDescription = s.modelSelectorTitle,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            if (pendingAttachments.isNotEmpty()) {
+                                Text(
+                                    text = "${pendingAttachments.size} ${s.attachmentsCountLabel}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            IconButton(
+                                onClick = { showParamsSheet = true },
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("playground_params_btn")
+                            ) {
+                                Icon(
+                                    Icons.Default.Tune,
+                                    contentDescription = s.parameters,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showAttachSheet) {
+        PlaygroundAttachBottomSheet(
+            onDismiss = { showAttachSheet = false },
+            onPickCamera = {
+                val hasCamera = runCatching {
+                    context.packageManager.resolveActivity(Intent(MediaStore.ACTION_IMAGE_CAPTURE), 0) != null
+                }.getOrDefault(false)
+                if (!hasCamera) {
+                    showAttachSheet = false
+                    inlineError = s.cameraUnavailableError
+                    return@PlaygroundAttachBottomSheet
+                }
+                val target = runCatching {
+                    PlaygroundAttachmentManager.createCameraCaptureTarget(context)
+                }.getOrElse {
+                    showAttachSheet = false
+                    inlineError = s.cameraCaptureFailedError
+                    return@PlaygroundAttachBottomSheet
+                }
+                pendingCameraPath = target.first.absolutePath
+                showAttachSheet = false
+                try {
+                    cameraLauncher.launch(target.second)
+                } catch (_: ActivityNotFoundException) {
+                    pendingCameraPath = null
+                    runCatching { target.first.delete() }
+                    inlineError = s.cameraUnavailableError
+                }
+            },
+            onPickPhotos = {
+                showAttachSheet = false
+                photosLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            },
+            onPickFiles = {
+                showAttachSheet = false
+                filesLauncher.launch(
+                    arrayOf(
+                        "application/pdf",
+                        "text/plain",
+                        "text/markdown",
+                        "text/csv",
+                        "application/json",
+                        "image/*"
+                    )
+                )
+            }
+        )
+    }
+
+    if (showModelSheet) {
+        PlaygroundModelSelectorSheet(
+            isAutoMode = isAutoMode,
+            selectedProviderId = selectedProviderId,
+            selectedModelId = selectedModelId,
+            eligibleFreeCount = eligibleFreeCount,
+            providers = providers,
+            localServers = localServers,
+            models = models,
+            settings = settings,
+            onToggleAutoFreeIncludeLocal = { viewModel.setAutoFreeIncludeLocal(it) },
+            onToggleManualFallback = { viewModel.setManualModelFallbackEnabled(it) },
+            onSelectAuto = {
+                isAutoMode = true
+                selectedProviderId = null
+                selectedModelId = ""
+                showModelSheet = false
+            },
+            onSelectModel = { provId, modId ->
+                isAutoMode = false
+                selectedProviderId = provId
+                selectedModelId = modId
+                showModelSheet = false
+            },
+            onOpenCustomModelDialog = {
+                showModelSheet = false
+                customModelDialogVisible = true
+            },
+            onNavigate = onNavigate,
+            onDismiss = { showModelSheet = false }
+        )
+    }
+
+    if (showHistorySheet) {
+        PlaygroundHistoryBottomSheet(
+            sessions = sessions,
+            activeSessionId = activeSessionId,
+            onSelectSession = { viewModel.selectOrCreateSession(it) },
+            onDeleteSession = { viewModel.deleteSession(it) },
+            onNewChat = { viewModel.selectOrCreateSession(null) },
+            onDismiss = { showHistorySheet = false }
+        )
+    }
+
+    if (showParamsSheet) {
+        PlaygroundParamsBottomSheet(
+            systemPrompt = systemPrompt,
+            onSystemPromptChange = { systemPrompt = it },
+            temperature = temperature,
+            onTemperatureChange = { temperature = it },
+            topP = topP,
+            onTopPChange = { topP = it },
+            maxTokensText = maxTokensText,
+            onMaxTokensChange = { maxTokensText = it },
+            stopSeqText = stopSeqText,
+            onStopSeqChange = { stopSeqText = it },
+            streamingEnabled = streamingEnabled,
+            onStreamingChange = { streamingEnabled = it },
+            streamSupported = selectedModelEntity?.supportsStreaming ?: true,
+            jsonOutput = jsonOutput,
+            onJsonOutputChange = { jsonOutput = it },
+            jsonSupported = !selectedModelId.contains("cohere", true),
+            onDismiss = { showParamsSheet = false }
+        )
     }
 
     if (customModelDialogVisible) {
@@ -555,12 +987,18 @@ fun PlaygroundScreen(
                     label = { Text(s.customModelHint) },
                     textStyle = MonoTextStyle,
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth().testTag("playground_custom_model_input")
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("playground_custom_model_input")
                 )
             },
             confirmButton = {
                 Button(onClick = {
-                    selectedModelId = customInput.trim()
+                    val trimmed = customInput.trim()
+                    if (trimmed.isNotBlank()) {
+                        isAutoMode = false
+                        selectedModelId = trimmed
+                    }
                     customModelDialogVisible = false
                 }) { Text(s.confirm) }
             },
@@ -570,3 +1008,106 @@ fun PlaygroundScreen(
         )
     }
 }
+
+@Composable
+private fun AttachmentPreviewStrip(
+    attachments: List<PendingAttachment>,
+    s: AppStrings,
+    onRemove: (PendingAttachment) -> Unit
+) {
+    LazyRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp),
+        modifier = Modifier.testTag("playground_attachment_preview_strip")
+    ) {
+        items(attachments, key = { it.id }) { att ->
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                modifier = Modifier.widthIn(min = 120.dp, max = 200.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(start = 6.dp, top = 4.dp, bottom = 4.dp, end = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (att.category == AttachmentCategory.IMAGE) {
+                        val thumb by produceState<ImageBitmap?>(initialValue = null, att.localFilePath) {
+                            value = withContext(Dispatchers.IO) {
+                                decodeSampledBitmap(att.localFilePath)
+                            }
+                        }
+                        if (thumb != null) {
+                            Image(
+                                bitmap = thumb!!,
+                                contentDescription = att.displayName,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(MaterialTheme.colorScheme.primaryContainer),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.Image, contentDescription = null, modifier = Modifier.size(20.dp))
+                            }
+                        }
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.secondaryContainer),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(20.dp))
+                        }
+                    }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = att.displayName,
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = PlaygroundAttachmentManager.formatReadableSize(att.sizeBytes),
+                            style = MonoTextStyle,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1
+                        )
+                    }
+
+                    IconButton(
+                        onClick = { onRemove(att) },
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("playground_remove_attachment_${att.id}")
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = s.removeAttachment,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun decodeSampledBitmap(path: String): ImageBitmap? = runCatching {
+    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, opts)
+    val maxDim = maxOf(opts.outWidth, opts.outHeight).coerceAtLeast(1)
+    var sample = 1
+    while (maxDim / sample > 256) sample *= 2
+    val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
+    BitmapFactory.decodeFile(path, decodeOpts)?.asImageBitmap()
+}.getOrNull()
