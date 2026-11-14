@@ -381,6 +381,7 @@ private fun JhGetWayMainShell(viewModel: GatewayViewModel) {
 
     if (updateState.showPromptDialog) {
         updateState.availableRelease?.let { release ->
+            val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
             AlertDialog(
                 onDismissRequest = {
                     if (!updateState.isDownloading) viewModel.dismissUpdateDialog()
@@ -392,6 +393,13 @@ private fun JhGetWayMainShell(viewModel: GatewayViewModel) {
                         modifier = Modifier.verticalScroll(rememberScrollState())
                     ) {
                         Text(release.releaseTitle, style = MaterialTheme.typography.titleSmall)
+                        if (!BuildConfig.DEBUG && release.signingMode == "ci-ephemeral") {
+                            Text(
+                                text = s.ephemeralReleaseWarning,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.tertiary
+                            )
+                        }
                         if (release.releaseNotes.isNotBlank()) {
                             Text(
                                 text = "${s.releaseNotesLabel}:\n${release.releaseNotes.take(600)}",
@@ -409,13 +417,30 @@ private fun JhGetWayMainShell(viewModel: GatewayViewModel) {
                                 style = MaterialTheme.typography.labelSmall
                             )
                         }
-                        updateState.errorMessage?.let { err ->
-                            Text(err, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                        if (updateState.signingConflict) {
+                            Text(
+                                text = s.updateSigningConflictMessage,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        } else {
+                            updateState.errorMessage?.let { err ->
+                                Text(err, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                            }
                         }
                     }
                 },
                 confirmButton = {
-                    if (updateState.downloadedApkFile != null) {
+                    if (updateState.signingConflict) {
+                        Button(
+                            onClick = {
+                                runCatching { uriHandler.openUri(release.htmlUrl) }
+                            },
+                            modifier = Modifier.testTag("update_dialog_open_release_btn")
+                        ) {
+                            Text(s.openReleasePageLabel)
+                        }
+                    } else if (updateState.downloadedApkFile != null) {
                         Button(
                             onClick = { viewModel.launchDownloadedApkInstall() },
                             modifier = Modifier.testTag("update_dialog_install_btn")

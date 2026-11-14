@@ -496,6 +496,9 @@ interface AppStrings {
     val noFetchedModelsMatch: String
     val customModelHint: String
     val playgroundNoActiveProviderHint: String
+    val updateSigningConflictMessage: String
+    val ephemeralReleaseWarning: String
+    val openReleasePageLabel: String
 }
 
 val LocalStrings = staticCompositionLocalOf<AppStrings> { EnglishStrings }

@@ -49,21 +49,26 @@ jobs:
       - name: Ensure debug keystore exists
         run: |
           if [ ! -f debug.keystore ]; then
-            keytool -genkeypair -v \
-              -keystore debug.keystore \
-              -storepass android \
-              -alias androiddebugkey \
-              -keypass android \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
+            if [ -f debug.keystore.base64 ]; then
+              base64 --decode debug.keystore.base64 > debug.keystore
+              echo "Restored persistent debug.keystore from debug.keystore.base64"
+            else
+              keytool -genkeypair -v \
+                -keystore debug.keystore \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
           fi
 
       - name: Run core unit, Robolectric & updater tests
         timeout-minutes: 10
         run: |
-          TEST_ARGS="--tests com.example.ExampleUnitTest --tests com.example.ExampleRobolectricTest --tests com.example.AppUpdateManagerTest --console=plain --no-daemon"
+          TEST_ARGS="--tests com.example.ExampleUnitTest --tests com.example.ExampleRobolectricTest --tests com.example.AppUpdateManagerTest --tests com.example.RouterAndModelSelectionTest --console=plain --no-daemon"
           if [ -x ./gradlew ]; then
             ./gradlew :app:testDebugUnitTest ${TEST_ARGS}
           else
@@ -126,15 +131,20 @@ jobs:
           SECRET_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           if [ ! -f debug.keystore ]; then
-            keytool -genkeypair -v \
-              -keystore debug.keystore \
-              -storepass android \
-              -alias androiddebugkey \
-              -keypass android \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
+            if [ -f debug.keystore.base64 ]; then
+              base64 --decode debug.keystore.base64 > debug.keystore
+              echo "Restored persistent debug.keystore from debug.keystore.base64"
+            else
+              keytool -genkeypair -v \
+                -keystore debug.keystore \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
           fi
 
           if [ -n "${KEYSTORE_BASE64}" ] && [ -n "${SECRET_STORE_PASSWORD}" ] && [ -n "${SECRET_KEY_PASSWORD}" ]; then
@@ -159,7 +169,7 @@ jobs:
             echo "STORE_PASSWORD=${FALLBACK_PASS}" >> "$GITHUB_ENV"
             echo "KEY_PASSWORD=${FALLBACK_PASS}" >> "$GITHUB_ENV"
             echo "signing_mode=ci-ephemeral" >> "$GITHUB_OUTPUT"
-            echo "::warning::KEYSTORE_BASE64 / STORE_PASSWORD / KEY_PASSWORD secrets are not set. Using a temporary CI keystore. Add these GitHub Secrets so future APK updates can install over previous versions without uninstalling."
+            echo "::warning::KEYSTORE_BASE64 / STORE_PASSWORD / KEY_PASSWORD secrets are not set. Using a temporary CI keystore. Add these GitHub Secrets so future release APK updates can install over previous versions without uninstalling."
           fi
 
       - name: Build Release & Debug APKs
@@ -196,12 +206,16 @@ jobs:
 
           RELEASE_APK_NAME="JH-GetWay-${RELEASE_TAG}-release.apk"
           cp "${RELEASE_APK_SRC}" "release-artifacts/${RELEASE_APK_NAME}"
+          APK_SHA256=$(sha256sum "release-artifacts/${RELEASE_APK_NAME}" | awk '{print $1}')
 
+          DEBUG_APK_NAME=""
+          DEBUG_APK_SHA256=""
           if [ -n "${DEBUG_APK_SRC}" ]; then
-            cp "${DEBUG_APK_SRC}" "release-artifacts/JH-GetWay-${RELEASE_TAG}-debug.apk"
+            DEBUG_APK_NAME="JH-GetWay-${RELEASE_TAG}-debug.apk"
+            cp "${DEBUG_APK_SRC}" "release-artifacts/${DEBUG_APK_NAME}"
+            DEBUG_APK_SHA256=$(sha256sum "release-artifacts/${DEBUG_APK_NAME}" | awk '{print $1}')
           fi
 
-          APK_SHA256=$(sha256sum "release-artifacts/${RELEASE_APK_NAME}" | awk '{print $1}')
           BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           cat > release-artifacts/update-manifest.json <<EOF
@@ -211,6 +225,8 @@ jobs:
             "tag": "${RELEASE_TAG}",
             "apkName": "${RELEASE_APK_NAME}",
             "sha256": "${APK_SHA256}",
+            "debugApkName": "${DEBUG_APK_NAME}",
+            "debugSha256": "${DEBUG_APK_SHA256}",
             "releaseDate": "${BUILD_DATE}",
             "signingMode": "${SIGNING_MODE}"
           }

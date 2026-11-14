@@ -2,14 +2,19 @@ package com.example.updater
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
+import android.content.pm.Signature
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
+import com.example.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -28,8 +33,22 @@ data class AppReleaseInfo(
     val apkDownloadUrl: String,
     val apkFileName: String,
     val apkSizeBytes: Long,
-    val expectedSha256: String? = null
+    val expectedSha256: String? = null,
+    val signingMode: String? = null
 )
+
+data class SelectedApkAsset(
+    val downloadUrl: String,
+    val fileName: String,
+    val sizeBytes: Long,
+    val isDebugAsset: Boolean
+)
+
+sealed interface ApkSignatureCheckResult {
+    data object Compatible : ApkSignatureCheckResult
+    data class Mismatch(val installedSha256: String, val apkSha256: String) : ApkSignatureCheckResult
+    data object Unavailable : ApkSignatureCheckResult
+}
 
 sealed interface AppUpdateCheckResult {
     data class UpdateAvailable(val release: AppReleaseInfo) : AppUpdateCheckResult
@@ -41,6 +60,7 @@ sealed interface AppUpdateCheckResult {
 sealed interface ApkInstallLaunchResult {
     data object Launched : ApkInstallLaunchResult
     data object UnknownSourcesPermissionRequired : ApkInstallLaunchResult
+    data class SigningConflict(val installedSha256: String, val apkSha256: String) : ApkInstallLaunchResult
     data class Failed(val message: String) : ApkInstallLaunchResult
 }
 
@@ -56,7 +76,9 @@ object AppUpdateManager {
             .followSslRedirects(true)
             .addNetworkInterceptor { chain ->
                 val req = chain.request()
-                if (!req.url.isHttps) {
+                val host = req.url.host
+                val isLocalTest = host == "127.0.0.1" || host == "localhost"
+                if (!req.url.isHttps && !isLocalTest) {
                     throw SecurityException("Only HTTPS update endpoints are permitted.")
                 }
                 chain.proceed(req)
@@ -72,7 +94,9 @@ object AppUpdateManager {
             .followSslRedirects(true)
             .addNetworkInterceptor { chain ->
                 val req = chain.request()
-                if (!req.url.isHttps) {
+                val host = req.url.host
+                val isLocalTest = host == "127.0.0.1" || host == "localhost"
+                if (!req.url.isHttps && !isLocalTest) {
                     throw SecurityException("Only HTTPS APK downloads are permitted.")
                 }
                 chain.proceed(req)
@@ -131,15 +155,51 @@ object AppUpdateManager {
         return cleaned.split('.').mapNotNull { it.trim().toIntOrNull() }
     }
 
+    fun selectPreferredApkAsset(
+        assets: JSONArray,
+        preferDebugApk: Boolean,
+        allowLocalHttpForTesting: Boolean = false
+    ): SelectedApkAsset? {
+        val apks = mutableListOf<SelectedApkAsset>()
+        for (i in 0 until assets.length()) {
+            val asset = assets.optJSONObject(i) ?: continue
+            val name = asset.optString("name", "")
+            val dlUrl = asset.optString("browser_download_url", "")
+            val size = asset.optLong("size", 0L)
+            val urlAllowed = dlUrl.startsWith("https://") ||
+                (allowLocalHttpForTesting && (dlUrl.startsWith("http://127.0.0.1") || dlUrl.startsWith("http://localhost")))
+            if (name.endsWith(".apk", ignoreCase = true) && urlAllowed) {
+                apks += SelectedApkAsset(
+                    downloadUrl = dlUrl,
+                    fileName = name,
+                    sizeBytes = size,
+                    isDebugAsset = name.contains("debug", ignoreCase = true)
+                )
+            }
+        }
+        if (apks.isEmpty()) return null
+        return if (preferDebugApk) {
+            apks.firstOrNull { it.isDebugAsset } ?: apks.first()
+        } else {
+            apks.firstOrNull { it.fileName.contains("release", ignoreCase = true) }
+                ?: apks.firstOrNull { !it.isDebugAsset }
+                ?: apks.first()
+        }
+    }
+
     suspend fun checkForUpdate(
         repoInput: String,
         currentVersionCode: Int,
-        currentVersionName: String
+        currentVersionName: String,
+        preferDebugApk: Boolean = BuildConfig.DEBUG,
+        apiBaseUrl: String = "https://api.github.com"
     ): AppUpdateCheckResult = withContext(Dispatchers.IO) {
         val repoSlug = normalizeGithubRepo(repoInput)
             ?: return@withContext AppUpdateCheckResult.Error("Invalid GitHub repository format. Use owner/repo.")
 
-        val url = "https://api.github.com/repos/$repoSlug/releases/latest"
+        val cleanBase = apiBaseUrl.trimEnd('/')
+        val allowLocalTestHttp = cleanBase.startsWith("http://127.0.0.1") || cleanBase.startsWith("http://localhost")
+        val url = "$cleanBase/repos/$repoSlug/releases/latest"
         val request = Request.Builder()
             .url(url)
             .header("Accept", "application/vnd.github+json")
@@ -170,45 +230,44 @@ object AppUpdateManager {
                 val htmlUrl = json.optString("html_url", "https://github.com/$repoSlug/releases/latest")
                 val publishedAt = json.optString("published_at", "")
 
-                val assets = json.optJSONArray("assets")
-                var apkUrl = ""
-                var apkName = ""
-                var apkSize = 0L
+                val assets = json.optJSONArray("assets") ?: JSONArray()
+                val selectedApk = selectPreferredApkAsset(assets, preferDebugApk, allowLocalTestHttp)
                 var manifestUrl = ""
-
-                if (assets != null) {
-                    for (i in 0 until assets.length()) {
-                        val asset = assets.optJSONObject(i) ?: continue
-                        val name = asset.optString("name", "")
-                        val dlUrl = asset.optString("browser_download_url", "")
-                        val size = asset.optLong("size", 0L)
-                        if (name.equals("update-manifest.json", ignoreCase = true) && dlUrl.startsWith("https://")) {
-                            manifestUrl = dlUrl
-                        } else if (name.endsWith(".apk", ignoreCase = true) && dlUrl.startsWith("https://")) {
-                            val isPreferredReleaseApk = name.contains("release", ignoreCase = true)
-                            if (apkUrl.isEmpty() || isPreferredReleaseApk) {
-                                apkUrl = dlUrl
-                                apkName = name
-                                apkSize = size
-                            }
-                        }
+                for (i in 0 until assets.length()) {
+                    val asset = assets.optJSONObject(i) ?: continue
+                    val name = asset.optString("name", "")
+                    val dlUrl = asset.optString("browser_download_url", "")
+                    val urlAllowed = dlUrl.startsWith("https://") ||
+                        (allowLocalTestHttp && (dlUrl.startsWith("http://127.0.0.1") || dlUrl.startsWith("http://localhost")))
+                    if (name.equals("update-manifest.json", ignoreCase = true) && urlAllowed) {
+                        manifestUrl = dlUrl
                     }
                 }
 
-                if (apkUrl.isBlank()) {
+                if (selectedApk == null) {
                     return@withContext AppUpdateCheckResult.Error("Latest release ($tagName) has no APK asset attached.")
                 }
 
                 var manifestVersionCode: Int? = null
                 var manifestVersionName: String? = null
-                var expectedSha256: String? = null
+                var releaseSha256: String? = null
+                var debugSha256: String? = null
+                var signingMode: String? = null
 
                 if (manifestUrl.isNotBlank()) {
                     fetchUpdateManifest(manifestUrl, currentVersionName)?.let { m ->
                         manifestVersionCode = m.optInt("versionCode", -1).takeIf { it > 0 }
                         manifestVersionName = m.optString("versionName", "").takeIf { it.isNotBlank() }
-                        expectedSha256 = m.optString("sha256", "").takeIf { it.isNotBlank() }
+                        releaseSha256 = m.optString("sha256", "").takeIf { it.isNotBlank() }
+                        debugSha256 = m.optString("debugSha256", "").takeIf { it.isNotBlank() }
+                        signingMode = m.optString("signingMode", "").takeIf { it.isNotBlank() }
                     }
+                }
+
+                val expectedSha256 = if (selectedApk.isDebugAsset) {
+                    debugSha256
+                } else {
+                    releaseSha256
                 }
 
                 val effectiveVersionName = manifestVersionName ?: tagName.removePrefix("v").removePrefix("V")
@@ -230,10 +289,11 @@ object AppUpdateManager {
                             releaseNotes = releaseNotes,
                             htmlUrl = htmlUrl,
                             publishedAt = publishedAt,
-                            apkDownloadUrl = apkUrl,
-                            apkFileName = apkName.ifBlank { "JH-GetWay-$tagName.apk" },
-                            apkSizeBytes = apkSize,
-                            expectedSha256 = expectedSha256
+                            apkDownloadUrl = selectedApk.downloadUrl,
+                            apkFileName = selectedApk.fileName.ifBlank { "JH-GetWay-$tagName.apk" },
+                            apkSizeBytes = selectedApk.sizeBytes,
+                            expectedSha256 = expectedSha256,
+                            signingMode = if (selectedApk.isDebugAsset) "debug-persistent" else signingMode
                         )
                     )
                 } else {
@@ -358,9 +418,78 @@ object AppUpdateManager {
         }
     }
 
+    fun hasMatchingSigningCertificate(
+        installedDigests: Set<String>,
+        apkDigests: Set<String>
+    ): Boolean {
+        if (installedDigests.isEmpty() || apkDigests.isEmpty()) return false
+        return installedDigests.any { it in apkDigests }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun extractSigningDigests(packageInfo: PackageInfo?): Set<String> {
+        if (packageInfo == null) return emptySet()
+        val signatures: Array<Signature> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val info = packageInfo.signingInfo
+            if (info != null) {
+                info.apkContentsSigners ?: info.signingCertificateHistory ?: emptyArray()
+            } else {
+                packageInfo.signatures ?: emptyArray()
+            }
+        } else {
+            packageInfo.signatures ?: emptyArray()
+        }
+        return signatures.mapNotNull { sig ->
+            runCatching {
+                val digest = MessageDigest.getInstance("SHA-256").digest(sig.toByteArray())
+                digest.joinToString("") { "%02x".format(it) }
+            }.getOrNull()
+        }.toSet()
+    }
+
+    @Suppress("DEPRECATION")
+    fun verifyApkSignatureMatchesInstalledApp(context: Context, apkFile: File): ApkSignatureCheckResult {
+        if (!apkFile.exists()) return ApkSignatureCheckResult.Unavailable
+        return runCatching {
+            val pm = context.packageManager
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                PackageManager.GET_SIGNING_CERTIFICATES
+            } else {
+                PackageManager.GET_SIGNATURES
+            }
+            val installedInfo = pm.getPackageInfo(context.packageName, flags)
+            val archiveInfo = pm.getPackageArchiveInfo(apkFile.absolutePath, flags)
+                ?: return@runCatching ApkSignatureCheckResult.Unavailable
+
+            val installedDigests = extractSigningDigests(installedInfo)
+            val apkDigests = extractSigningDigests(archiveInfo)
+            if (installedDigests.isEmpty() || apkDigests.isEmpty()) {
+                return@runCatching ApkSignatureCheckResult.Unavailable
+            }
+
+            if (hasMatchingSigningCertificate(installedDigests, apkDigests)) {
+                ApkSignatureCheckResult.Compatible
+            } else {
+                ApkSignatureCheckResult.Mismatch(
+                    installedSha256 = installedDigests.first(),
+                    apkSha256 = apkDigests.first()
+                )
+            }
+        }.getOrElse { ApkSignatureCheckResult.Unavailable }
+    }
+
     fun launchApkInstaller(context: Context, apkFile: File): ApkInstallLaunchResult {
         if (!apkFile.exists()) {
             return ApkInstallLaunchResult.Failed("Downloaded APK file not found.")
+        }
+        when (val sigCheck = verifyApkSignatureMatchesInstalledApp(context, apkFile)) {
+            is ApkSignatureCheckResult.Mismatch -> {
+                return ApkInstallLaunchResult.SigningConflict(
+                    installedSha256 = sigCheck.installedSha256,
+                    apkSha256 = sigCheck.apkSha256
+                )
+            }
+            else -> Unit
         }
         if (!canRequestPackageInstalls(context)) {
             return ApkInstallLaunchResult.UnknownSourcesPermissionRequired

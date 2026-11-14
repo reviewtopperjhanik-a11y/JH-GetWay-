@@ -347,9 +347,14 @@ fun SettingsScreen(
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     Text(s.updateCheckingLabel, style = MaterialTheme.typography.bodySmall)
                 }
-                updateState.errorMessage?.let { errMsg ->
+                if (updateState.signingConflict) {
                     Spacer(Modifier.height(6.dp))
-                    Text(errMsg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    Text(s.updateSigningConflictMessage, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                } else {
+                    updateState.errorMessage?.let { errMsg ->
+                        Spacer(Modifier.height(6.dp))
+                        Text(errMsg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    }
                 }
                 updateState.statusMessage?.let { statusMsg ->
                     if (updateState.availableRelease == null && !updateState.isChecking) {
@@ -358,6 +363,7 @@ fun SettingsScreen(
                     }
                 }
                 updateState.availableRelease?.let { release ->
+                    val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
                     Spacer(Modifier.height(8.dp))
                     Surface(
                         color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
@@ -370,6 +376,13 @@ fun SettingsScreen(
                                 style = MaterialTheme.typography.titleSmall,
                                 color = MaterialTheme.colorScheme.primary
                             )
+                            if (!BuildConfig.DEBUG && release.signingMode == "ci-ephemeral") {
+                                Text(
+                                    text = s.ephemeralReleaseWarning,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.tertiary
+                                )
+                            }
                             if (release.releaseNotes.isNotBlank()) {
                                 Text(
                                     release.releaseNotes.take(280),
@@ -386,6 +399,15 @@ fun SettingsScreen(
                                     "${s.downloadingUpdateLabel} ${updateState.downloadProgressPct}%",
                                     style = MaterialTheme.typography.labelSmall
                                 )
+                            } else if (updateState.signingConflict) {
+                                OutlinedButton(
+                                    onClick = { runCatching { uriHandler.openUri(release.htmlUrl) } },
+                                    modifier = Modifier.fillMaxWidth().testTag("settings_open_release_page_btn")
+                                ) {
+                                    Icon(Icons.Default.OpenInBrowser, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(s.openReleasePageLabel)
+                                }
                             } else if (updateState.downloadedApkFile != null) {
                                 Button(
                                     onClick = { viewModel.launchDownloadedApkInstall() },

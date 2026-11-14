@@ -467,4 +467,7 @@ object EnglishStrings : AppStrings {
     override val noFetchedModelsMatch = "No models match your search."
     override val customModelHint = "Custom model ID or alias (optional)"
     override val playgroundNoActiveProviderHint = "Add or enable a provider with an API key to chat."
+    override val updateSigningConflictMessage = "Package signing key mismatch: this APK was signed with a different certificate than the app currently installed on your phone. Export an Encrypted Backup in Settings first, uninstall the current app once, then install the new APK (or configure KEYSTORE_BASE64 in GitHub Secrets for in-place release updates)."
+    override val ephemeralReleaseWarning = "Note: This release APK uses a temporary CI signing key. If upgrading from an earlier CI release, uninstall the old app once (after backing up) or install the matching debug APK instead."
+    override val openReleasePageLabel = "Open GitHub Release"
 }

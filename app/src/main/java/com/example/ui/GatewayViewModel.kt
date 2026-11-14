@@ -70,7 +70,8 @@ data class AppUpdateUiState(
     val statusMessage: String? = null,
     val errorMessage: String? = null,
     val showPromptDialog: Boolean = false,
-    val needsInstallPermission: Boolean = false
+    val needsInstallPermission: Boolean = false,
+    val signingConflict: Boolean = false
 )
 
 data class FetchedModelsPrompt(
@@ -1671,7 +1672,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                             downloadedApkFile = null,
                             statusMessage = "Update ${res.release.tagName} available",
                             errorMessage = null,
-                            showPromptDialog = !silent || !skipped
+                            showPromptDialog = !silent || !skipped,
+                            signingConflict = false
                         )
                     }
                     logEvent(ActivityCategory.SYSTEM_EVENT, "App Updater", "UPDATE_FOUND", "Release ${res.release.tagName} available from $repoSlug")
@@ -1683,7 +1685,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                             availableRelease = null,
                             statusMessage = "Up to date (v${res.currentVersionName})",
                             errorMessage = null,
-                            showPromptDialog = false
+                            showPromptDialog = false,
+                            signingConflict = false
                         )
                     }
                     if (!silent) {
@@ -1697,7 +1700,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                             availableRelease = null,
                             statusMessage = if (silent) null else "No releases published yet for ${res.repoSlug}.",
                             errorMessage = null,
-                            showPromptDialog = false
+                            showPromptDialog = false,
+                            signingConflict = false
                         )
                     }
                 }
@@ -1706,7 +1710,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                         it.copy(
                             isChecking = false,
                             errorMessage = if (silent) null else res.message,
-                            showPromptDialog = false
+                            showPromptDialog = false,
+                            signingConflict = false
                         )
                     }
                 }
@@ -1723,6 +1728,7 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                     isDownloading = true,
                     downloadProgressPct = 0,
                     errorMessage = null,
+                    signingConflict = false,
                     statusMessage = "Downloading ${release.apkFileName}..."
                 )
             }
@@ -1741,7 +1747,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                             downloadProgressPct = 100,
                             downloadedApkFile = apkFile,
                             statusMessage = "Ready to install ${release.tagName}",
-                            errorMessage = null
+                            errorMessage = null,
+                            signingConflict = false
                         )
                     }
                     logEvent(ActivityCategory.SYSTEM_EVENT, "App Updater", "APK_DOWNLOADED", "Downloaded ${release.apkFileName}")
@@ -1753,7 +1760,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
                         it.copy(
                             isDownloading = false,
                             errorMessage = safeMsg,
-                            statusMessage = null
+                            statusMessage = null,
+                            signingConflict = false
                         )
                     }
                     postBanner("Update download failed: $safeMsg")
@@ -1766,13 +1774,25 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
         val apkFile = _appUpdateUiState.value.downloadedApkFile ?: return
         when (val launch = AppUpdateManager.launchApkInstaller(app, apkFile)) {
             is ApkInstallLaunchResult.Launched -> {
-                _appUpdateUiState.update { it.copy(needsInstallPermission = false, errorMessage = null) }
+                _appUpdateUiState.update {
+                    it.copy(needsInstallPermission = false, errorMessage = null, signingConflict = false)
+                }
             }
             is ApkInstallLaunchResult.UnknownSourcesPermissionRequired -> {
-                _appUpdateUiState.update { it.copy(needsInstallPermission = true) }
+                _appUpdateUiState.update { it.copy(needsInstallPermission = true, signingConflict = false) }
+            }
+            is ApkInstallLaunchResult.SigningConflict -> {
+                val msg = "Package signing key mismatch (${launch.installedSha256.take(8)} vs ${launch.apkSha256.take(8)}). Back up data, uninstall old build once, then install the new APK."
+                _appUpdateUiState.update {
+                    it.copy(signingConflict = true, errorMessage = msg)
+                }
+                viewModelScope.launch {
+                    logEvent(ActivityCategory.SYSTEM_EVENT, "App Updater", "SIGNING_CONFLICT", msg)
+                }
+                postBanner(msg)
             }
             is ApkInstallLaunchResult.Failed -> {
-                _appUpdateUiState.update { it.copy(errorMessage = launch.message) }
+                _appUpdateUiState.update { it.copy(errorMessage = launch.message, signingConflict = false) }
                 postBanner(launch.message)
             }
         }

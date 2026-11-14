@@ -467,4 +467,7 @@ object BengaliStrings : AppStrings {
     override val noFetchedModelsMatch = "আপনার খোঁজার সাথে কোনো মডেল মেলেনি।"
     override val customModelHint = "কাস্টম মডেল আইডি বা অ্যালিয়াস (ঐচ্ছিক)"
     override val playgroundNoActiveProviderHint = "চ্যাট করতে API কী সহ একটি প্রোভাইডার যুক্ত বা চালু করুন।"
+    override val updateSigningConflictMessage = "প্যাকেজ সাইনিং কী মিলছে না: আপনার ফোনে ইনস্টল করা অ্যাপ এবং এই নতুন APK-এর সাইনিং সার্টিফিকেট আলাদা। আগে Settings থেকে Encrypted Backup এক্সপোর্ট করে নিন, এরপর পুরনো অ্যাপটি একবার আনইনস্টল করে নতুন APK ইনস্টল করুন (অথবা ভবিষ্যতে সরাসরি আপডেটের জন্য GitHub Secrets-এ KEYSTORE_BASE64 সেট করুন)।"
+    override val ephemeralReleaseWarning = "নোট: এই রিলিজ APK-তে সাময়িক CI সাইনিং কী ব্যবহার হয়েছে। আগের CI রিলিজ থেকে আপডেট করলে (ব্যাকআপ নিয়ে) পুরনো অ্যাপ একবার আনইনস্টল করুন অথবা ম্যাচিং debug APK ব্যবহার করুন।"
+    override val openReleasePageLabel = "GitHub রিলিজ খুলুন"
 }
