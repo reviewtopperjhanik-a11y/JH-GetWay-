@@ -1,0 +1,249 @@
+name: Build & Release Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Optional release version name (e.g. 1.2.0). Leave blank for auto-versioning.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Ensure debug keystore exists
+        run: |
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Run core unit & updater tests
+        run: |
+          if [ -x ./gradlew ]; then
+            ./gradlew :app:testDebugUnitTest --tests com.example.ExampleUnitTest --tests com.example.AppUpdateManagerTest --console=plain --no-daemon
+          else
+            gradle :app:testDebugUnitTest --tests com.example.ExampleUnitTest --tests com.example.AppUpdateManagerTest --console=plain --no-daemon
+          fi
+
+      - name: Run full test suite (advisory)
+        continue-on-error: true
+        run: |
+          if [ -x ./gradlew ]; then
+            ./gradlew :app:testDebugUnitTest --console=plain --no-daemon
+          else
+            gradle :app:testDebugUnitTest --console=plain --no-daemon
+          fi
+
+  build-and-release:
+    name: Build APK & Publish Release
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Compute release version
+        id: version
+        shell: bash
+        run: |
+          VERSION_CODE=$((100 + GITHUB_RUN_NUMBER))
+
+          if [ -n "${{ github.event.inputs.version_name }}" ]; then
+            RAW_VER="${{ github.event.inputs.version_name }}"
+            VERSION_NAME="${RAW_VER#v}"
+            RELEASE_TAG="v${VERSION_NAME}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION_NAME="${GITHUB_REF_NAME#v}"
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+          else
+            VERSION_NAME="1.0.${GITHUB_RUN_NUMBER}"
+            RELEASE_TAG="v${VERSION_NAME}"
+          fi
+
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Computed version: ${VERSION_NAME} (code ${VERSION_CODE}, tag ${RELEASE_TAG})"
+
+      - name: Configure Android signing keystores
+        id: signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          SECRET_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          if [ -n "${KEYSTORE_BASE64}" ] && [ -n "${SECRET_STORE_PASSWORD}" ] && [ -n "${SECRET_KEY_PASSWORD}" ]; then
+            echo "${KEYSTORE_BASE64}" | base64 --decode > "${GITHUB_WORKSPACE}/my-upload-key.jks"
+            echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/my-upload-key.jks" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=${SECRET_STORE_PASSWORD}" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=${SECRET_KEY_PASSWORD}" >> "$GITHUB_ENV"
+            echo "signing_mode=production" >> "$GITHUB_OUTPUT"
+            echo "Configured production release signing keystore from GitHub Secrets."
+          else
+            FALLBACK_PASS="jhgetway-ci-release-key"
+            keytool -genkeypair -v \
+              -keystore "${GITHUB_WORKSPACE}/my-upload-key.jks" \
+              -storepass "${FALLBACK_PASS}" \
+              -alias upload \
+              -keypass "${FALLBACK_PASS}" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=JH GetWay CI,O=JH Soft Corporation,C=US"
+            echo "KEYSTORE_PATH=${GITHUB_WORKSPACE}/my-upload-key.jks" >> "$GITHUB_ENV"
+            echo "STORE_PASSWORD=${FALLBACK_PASS}" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=${FALLBACK_PASS}" >> "$GITHUB_ENV"
+            echo "signing_mode=ci-ephemeral" >> "$GITHUB_OUTPUT"
+            echo "::warning::KEYSTORE_BASE64 / STORE_PASSWORD / KEY_PASSWORD secrets are not set. Using a temporary CI keystore. Add these GitHub Secrets so future APK updates can install over previous versions without uninstalling."
+          fi
+
+      - name: Build Release & Debug APKs
+        env:
+          APP_VERSION_CODE: ${{ steps.version.outputs.version_code }}
+          APP_VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          GRADLE_ARGS="-PciVersionCode=${APP_VERSION_CODE} -PciVersionName=${APP_VERSION_NAME} -PgithubRepo=${GITHUB_REPOSITORY} --no-daemon --console=plain"
+          if [ -x ./gradlew ]; then
+            ./gradlew :app:assembleRelease :app:assembleDebug ${GRADLE_ARGS}
+          else
+            gradle :app:assembleRelease :app:assembleDebug ${GRADLE_ARGS}
+          fi
+
+      - name: Package APK & Update Manifest
+        id: package
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          RELEASE_TAG="${{ steps.version.outputs.release_tag }}"
+          VERSION_CODE="${{ steps.version.outputs.version_code }}"
+          VERSION_NAME="${{ steps.version.outputs.version_name }}"
+          SIGNING_MODE="${{ steps.signing.outputs.signing_mode }}"
+
+          RELEASE_APK_SRC=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          DEBUG_APK_SRC=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+
+          if [ -z "${RELEASE_APK_SRC}" ]; then
+            echo "Release APK not found!"
+            exit 1
+          fi
+
+          RELEASE_APK_NAME="JH-GetWay-${RELEASE_TAG}-release.apk"
+          cp "${RELEASE_APK_SRC}" "release-artifacts/${RELEASE_APK_NAME}"
+
+          if [ -n "${DEBUG_APK_SRC}" ]; then
+            cp "${DEBUG_APK_SRC}" "release-artifacts/JH-GetWay-${RELEASE_TAG}-debug.apk"
+          fi
+
+          APK_SHA256=$(sha256sum "release-artifacts/${RELEASE_APK_NAME}" | awk '{print $1}')
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          cat > release-artifacts/update-manifest.json <<EOF
+          {
+            "versionCode": ${VERSION_CODE},
+            "versionName": "${VERSION_NAME}",
+            "tag": "${RELEASE_TAG}",
+            "apkName": "${RELEASE_APK_NAME}",
+            "sha256": "${APK_SHA256}",
+            "releaseDate": "${BUILD_DATE}",
+            "signingMode": "${SIGNING_MODE}"
+          }
+          EOF
+
+          echo "release_apk=${RELEASE_APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=${APK_SHA256}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JH-GetWay-${{ steps.version.outputs.release_tag }}-apks
+          path: release-artifacts/*
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.release_tag }}
+          name: JH GetWay ${{ steps.version.outputs.release_tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## JH GetWay ${{ steps.version.outputs.release_tag }}
+
+            - **Version:** `${{ steps.version.outputs.version_name }}` (Build `${{ steps.version.outputs.version_code }}`)
+            - **Release APK:** `${{ steps.package.outputs.release_apk }}`
+            - **SHA-256:** `${{ steps.package.outputs.apk_sha256 }}`
+            - **Signing Mode:** `${{ steps.signing.outputs.signing_mode }}`
+
+            > **Note on Seamless Updates:** To allow Android devices to update in-place without uninstalling first, configure `KEYSTORE_BASE64`, `STORE_PASSWORD`, and `KEY_PASSWORD` in your repository's **Settings -> Secrets and variables -> Actions**.
+          files: |
+            release-artifacts/${{ steps.package.outputs.release_apk }}
+            release-artifacts/JH-GetWay-${{ steps.version.outputs.release_tag }}-debug.apk
+            release-artifacts/update-manifest.json
