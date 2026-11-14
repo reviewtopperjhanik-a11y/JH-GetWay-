@@ -71,10 +71,30 @@ jobs:
           GITHUB_REPOSITORY: ""
         run: |
           TEST_ARGS="--tests com.example.ExampleUnitTest --tests com.example.ExampleRobolectricTest --tests com.example.AppUpdateManagerTest --tests com.example.RouterAndModelSelectionTest -PgithubRepo= --console=plain --no-daemon"
+          set +e
           if [ -x ./gradlew ]; then
             ./gradlew :app:testDebugUnitTest ${TEST_ARGS}
           else
             gradle :app:testDebugUnitTest ${TEST_ARGS}
+          fi
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            python3 -c '
+          import glob, xml.etree.ElementTree as ET
+          for p in sorted(glob.glob("app/build/test-results/testDebugUnitTest/*.xml")):
+              root = ET.parse(p).getroot()
+              for tc in root.findall("testcase"):
+                  for tag in ("failure", "error"):
+                      el = tc.find(tag)
+                      if el is not None:
+                          cname = tc.attrib.get("classname", "")
+                          tname = tc.attrib.get("name", "")
+                          msg = (el.attrib.get("message", "") or "").replace("\n", " ")[:300]
+                          print(f"::error::{cname}.{tname} -> {msg}")
+                          print((el.text or "")[:1500])
+          '
+            exit "$STATUS"
           fi
 
       - name: Upload unit test failure reports

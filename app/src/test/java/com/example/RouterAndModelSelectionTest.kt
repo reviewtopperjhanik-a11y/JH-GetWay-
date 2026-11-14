@@ -75,6 +75,7 @@ class RouterAndModelSelectionTest {
         srv.start(wait = false)
         servers += srv
         val port = runBlocking { srv.engine.resolvedConnectors().first().port }
+        java.net.Socket("127.0.0.1", port).use { }
         return "http://127.0.0.1:$port"
     }
 
@@ -312,54 +313,62 @@ class RouterAndModelSelectionTest {
             )
         )
 
-        val vm = GatewayViewModel(app)
-        // Wait for ViewModel initial settings load
-        val initDeadline = System.nanoTime() + 10_000_000_000L
-        while (System.nanoTime() < initDeadline && !vm.settings.value.localNetworkAccessAllowed) {
-            Shadows.shadowOf(Looper.getMainLooper()).idle()
-            Thread.sleep(30)
-        }
-        assertTrue(vm.settings.value.localNetworkAccessAllowed)
-
-        vm.fetchProviderModels(provider, openPickerOnSuccess = true)
-
-        val fetchDeadline = System.nanoTime() + 10_000_000_000L
-        while (System.nanoTime() < fetchDeadline && vm.fetchedModelsPrompt.value == null) {
-            Shadows.shadowOf(Looper.getMainLooper()).idle()
-            Thread.sleep(30)
-        }
-
-        val prompt = vm.fetchedModelsPrompt.value
-        assertNotNull("Expected FetchedModelsPrompt to open after fetching models (banner=${vm.uiBannerMessage.value})", prompt)
-        assertEquals(3, prompt!!.models.size)
-
-        val proModel = prompt.models.first { it.modelId == "gemini-2.5-pro" }
-        vm.selectModelForProvider(provider.id, proModel)
-
-        val selectDeadline = System.nanoTime() + 10_000_000_000L
-        while (System.nanoTime() < selectDeadline) {
-            Shadows.shadowOf(Looper.getMainLooper()).idle()
-            val savedProv = app.database.providerDao().getById(provider.id)
-            if (savedProv?.defaultModel == "gemini-2.5-pro" && vm.settings.value.defaultModelId == "gemini-2.5-pro") {
-                break
+        val vmStore = androidx.lifecycle.ViewModelStore()
+        val vm = androidx.lifecycle.ViewModelProvider(
+            vmStore,
+            androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.getInstance(app)
+        )[GatewayViewModel::class.java]
+        try {
+            // Wait for ViewModel initial settings load
+            val initDeadline = System.nanoTime() + 10_000_000_000L
+            while (System.nanoTime() < initDeadline && !vm.settings.value.localNetworkAccessAllowed) {
+                Shadows.shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(30)
             }
-            Thread.sleep(30)
+            assertTrue(vm.settings.value.localNetworkAccessAllowed)
+
+            vm.fetchProviderModels(provider, openPickerOnSuccess = true)
+
+            val fetchDeadline = System.nanoTime() + 10_000_000_000L
+            while (System.nanoTime() < fetchDeadline && vm.fetchedModelsPrompt.value == null) {
+                Shadows.shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(30)
+            }
+
+            val prompt = vm.fetchedModelsPrompt.value
+            assertNotNull("Expected FetchedModelsPrompt to open after fetching models (banner=${vm.uiBannerMessage.value})", prompt)
+            assertEquals(3, prompt!!.models.size)
+
+            val proModel = prompt.models.first { it.modelId == "gemini-2.5-pro" }
+            vm.selectModelForProvider(provider.id, proModel)
+
+            val selectDeadline = System.nanoTime() + 10_000_000_000L
+            while (System.nanoTime() < selectDeadline) {
+                Shadows.shadowOf(Looper.getMainLooper()).idle()
+                val savedProv = app.database.providerDao().getById(provider.id)
+                if (savedProv?.defaultModel == "gemini-2.5-pro" && vm.settings.value.defaultModelId == "gemini-2.5-pro") {
+                    break
+                }
+                Thread.sleep(30)
+            }
+
+            val savedProv = app.database.providerDao().getById(provider.id)
+            assertEquals("gemini-2.5-pro", savedProv?.defaultModel)
+            assertEquals("gemini-2.5-pro", vm.settings.value.defaultModelId)
+            assertEquals(provider.id, vm.settings.value.defaultProviderId)
+
+            val persistedPro = app.database.modelDao().getByProvider(provider.id).first { it.modelId == "gemini-2.5-pro" }
+            assertTrue(persistedPro.isDefault)
+            assertTrue(persistedPro.enabled)
+
+            vm.openModelInPlayground(persistedPro)
+            assertEquals(provider.id, vm.playgroundTarget.value?.providerId)
+            assertEquals("gemini-2.5-pro", vm.playgroundTarget.value?.modelId)
+            vm.consumePlaygroundTarget()
+            assertNull(vm.playgroundTarget.value)
+        } finally {
+            vmStore.clear()
         }
-
-        val savedProv = app.database.providerDao().getById(provider.id)
-        assertEquals("gemini-2.5-pro", savedProv?.defaultModel)
-        assertEquals("gemini-2.5-pro", vm.settings.value.defaultModelId)
-        assertEquals(provider.id, vm.settings.value.defaultProviderId)
-
-        val persistedPro = app.database.modelDao().getByProvider(provider.id).first { it.modelId == "gemini-2.5-pro" }
-        assertTrue(persistedPro.isDefault)
-        assertTrue(persistedPro.enabled)
-
-        vm.openModelInPlayground(persistedPro)
-        assertEquals(provider.id, vm.playgroundTarget.value?.providerId)
-        assertEquals("gemini-2.5-pro", vm.playgroundTarget.value?.modelId)
-        vm.consumePlaygroundTarget()
-        assertNull(vm.playgroundTarget.value)
     }
 
     @Test

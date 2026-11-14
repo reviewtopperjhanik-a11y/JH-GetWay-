@@ -9,6 +9,8 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextReplacement
 import androidx.test.core.app.ApplicationProvider
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import com.example.core.i18n.EnglishStrings
 import com.example.core.i18n.LocalStrings
 import com.example.core.security.CryptoManager
@@ -46,6 +48,7 @@ class AppUpdateManagerTest {
     val composeRule = createComposeRule()
 
     private lateinit var app: JhGetWayApplication
+    private lateinit var vmStore: ViewModelStore
     private lateinit var viewModel: GatewayViewModel
 
     @Before
@@ -56,11 +59,16 @@ class AppUpdateManagerTest {
             app.preferences.clearAll()
             app.database.clearAllTables()
         }
-        viewModel = GatewayViewModel(app)
+        vmStore = ViewModelStore()
+        viewModel = ViewModelProvider(
+            vmStore,
+            ViewModelProvider.AndroidViewModelFactory.getInstance(app)
+        )[GatewayViewModel::class.java]
     }
 
     @After
     fun tearDown() {
+        vmStore.clear()
         runBlocking(Dispatchers.IO) {
             app.gatewayServer.stop()
             app.preferences.clearAll()
@@ -181,6 +189,7 @@ class AppUpdateManagerTest {
         }
         server.start(wait = false)
         port = server.engine.resolvedConnectors().first().port
+        java.net.Socket("127.0.0.1", port).use { }
         try {
             val base = "http://127.0.0.1:$port"
             val dbgRes = AppUpdateManager.checkForUpdate(
@@ -211,6 +220,12 @@ class AppUpdateManagerTest {
 
     @Test
     fun settingsScreen_savesNormalizedGithubUpdateRepository() {
+        val initDeadlineNs = System.nanoTime() + 10_000_000_000L
+        while (!viewModel.isInitialSettingsLoaded.value && System.nanoTime() < initDeadlineNs) {
+            Thread.sleep(25)
+            composeRule.waitForIdle()
+        }
+
         composeRule.setContent {
             CompositionLocalProvider(LocalStrings provides EnglishStrings) {
                 JhGetWayTheme {
@@ -233,7 +248,7 @@ class AppUpdateManagerTest {
         composeRule.onNodeWithTag("settings_github_repo_save_btn")
             .performClick()
 
-        val deadlineNs = System.nanoTime() + 5_000_000_000L
+        val deadlineNs = System.nanoTime() + 10_000_000_000L
         while (viewModel.effectiveGithubUpdateRepo() != "jhsoft/jh-getway" && System.nanoTime() < deadlineNs) {
             Thread.sleep(50)
             composeRule.waitForIdle()
