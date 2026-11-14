@@ -14,15 +14,22 @@ import org.json.JSONObject
 class AnthropicProviderAdapter : ProviderAdapter {
     override val apiFormat: ApiFormat = ApiFormat.ANTHROPIC
 
-    override fun capabilitiesForModel(modelId: String, modelEntity: ModelEntity?): ProviderCapabilities =
-        ProviderCapabilities(
+    override fun capabilitiesForModel(modelId: String, modelEntity: ModelEntity?): ProviderCapabilities {
+        val lower = modelId.lowercase()
+        val inferredVision = lower.contains("claude-3") ||
+            lower.contains("claude-sonnet-4") ||
+            lower.contains("claude-opus-4") ||
+            lower.contains("claude-haiku-4") ||
+            lower.contains("claude-4") ||
+            lower.contains("vision")
+        return ProviderCapabilities(
             supportsTools = modelEntity?.supportsTools ?: true,
             supportsToolChoice = modelEntity?.supportsTools ?: true,
             supportsJsonOutput = false,
             supportsStreaming = modelEntity?.supportsStreaming ?: true,
             supportsSystemRole = true,
             supportsDeveloperRole = false,
-            supportsVision = modelEntity?.supportsVision ?: true,
+            supportsVision = modelEntity == null || modelEntity.supportsVision || inferredVision,
             supportsStopSequences = true,
             supportsDocumentFiles = true,
             supportedDocumentMimeTypes = setOf(
@@ -33,6 +40,7 @@ class AnthropicProviderAdapter : ProviderAdapter {
                 "application/json"
             )
         )
+    }
 
     private fun v1Base(baseUrl: String): String {
         val clean = baseUrl.trimEnd('/')

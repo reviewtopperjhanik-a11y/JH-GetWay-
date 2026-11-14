@@ -220,6 +220,9 @@ interface WorkflowDao {
     @Query("SELECT * FROM workflow_runs ORDER BY startedAt DESC LIMIT 100")
     fun observeRuns(): Flow<List<WorkflowRunEntity>>
 
+    @Query("SELECT * FROM workflow_runs ORDER BY startedAt DESC")
+    suspend fun getRunsOnce(): List<WorkflowRunEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertRun(run: WorkflowRunEntity)
 
@@ -295,6 +298,9 @@ interface PlaygroundDao {
     @Query("SELECT * FROM playground_sessions ORDER BY updatedAt DESC")
     fun observeSessions(): Flow<List<PlaygroundSessionEntity>>
 
+    @Query("SELECT * FROM playground_sessions ORDER BY updatedAt DESC")
+    suspend fun getSessionsOnce(): List<PlaygroundSessionEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertSession(session: PlaygroundSessionEntity)
 
@@ -306,6 +312,9 @@ interface PlaygroundDao {
 
     @Query("SELECT * FROM playground_messages WHERE sessionId = :sessionId ORDER BY timestamp ASC")
     suspend fun getMessagesOnce(sessionId: String): List<PlaygroundMessageEntity>
+
+    @Query("SELECT * FROM playground_messages ORDER BY timestamp ASC")
+    suspend fun getAllMessagesOnce(): List<PlaygroundMessageEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMessage(message: PlaygroundMessageEntity)

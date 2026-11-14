@@ -518,4 +518,6 @@ object EnglishStrings : AppStrings {
     override val autoFreeIncludeLocalLabel = "Include local AI models in Auto"
     override val localSectionTitle = "Local AI"
     override val pinnedProviderLabel = "Pinned"
+    override val backupNonPortableDisclosure = "Included: Providers, API keys (re-encrypted), Models, Routing, Coding Agents, Local AI, MCP, Workflows & runs, Devices, Playground chats, Analytics metrics, and App settings. Excluded (re-set after reinstall): App Lock PIN/Biometric, local attachment files, and Android Keystore master key."
+    override val backupRestoreDetailsFormat = "Excluded items requiring re-setup if used: App Lock PIN/Biometric and local Playground attachment files."
 }

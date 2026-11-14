@@ -34,7 +34,9 @@ data class AppReleaseInfo(
     val apkFileName: String,
     val apkSizeBytes: Long,
     val expectedSha256: String? = null,
-    val signingMode: String? = null
+    val signingMode: String? = null,
+    val packageId: String? = null,
+    val expectedSigningCertSha256: String? = null
 )
 
 data class SelectedApkAsset(
@@ -181,9 +183,8 @@ object AppUpdateManager {
         return if (preferDebugApk) {
             apks.firstOrNull { it.isDebugAsset } ?: apks.first()
         } else {
-            apks.firstOrNull { it.fileName.contains("release", ignoreCase = true) }
+            apks.firstOrNull { !it.isDebugAsset && it.fileName.contains("release", ignoreCase = true) }
                 ?: apks.firstOrNull { !it.isDebugAsset }
-                ?: apks.first()
         }
     }
 
@@ -192,7 +193,8 @@ object AppUpdateManager {
         currentVersionCode: Int,
         currentVersionName: String,
         preferDebugApk: Boolean = BuildConfig.DEBUG,
-        apiBaseUrl: String = "https://api.github.com"
+        apiBaseUrl: String = "https://api.github.com",
+        expectedPackageId: String = BuildConfig.APPLICATION_ID
     ): AppUpdateCheckResult = withContext(Dispatchers.IO) {
         val repoSlug = normalizeGithubRepo(repoInput)
             ?: return@withContext AppUpdateCheckResult.Error("Invalid GitHub repository format. Use owner/repo.")
@@ -250,18 +252,34 @@ object AppUpdateManager {
 
                 var manifestVersionCode: Int? = null
                 var manifestVersionName: String? = null
+                var manifestPackageId: String? = null
                 var releaseSha256: String? = null
                 var debugSha256: String? = null
                 var signingMode: String? = null
+                var signingCertSha256: String? = null
 
                 if (manifestUrl.isNotBlank()) {
                     fetchUpdateManifest(manifestUrl, currentVersionName)?.let { m ->
                         manifestVersionCode = m.optInt("versionCode", -1).takeIf { it > 0 }
                         manifestVersionName = m.optString("versionName", "").takeIf { it.isNotBlank() }
+                        manifestPackageId = m.optString("packageId", m.optString("applicationId", ""))
+                            .trim()
+                            .takeIf { it.isNotBlank() }
                         releaseSha256 = m.optString("sha256", "").takeIf { it.isNotBlank() }
                         debugSha256 = m.optString("debugSha256", "").takeIf { it.isNotBlank() }
                         signingMode = m.optString("signingMode", "").takeIf { it.isNotBlank() }
+                        signingCertSha256 = m.optString("signingCertSha256", "")
+                            .replace(":", "")
+                            .trim()
+                            .lowercase()
+                            .takeIf { it.isNotBlank() }
                     }
+                }
+
+                if (manifestPackageId != null && expectedPackageId.isNotBlank() && manifestPackageId != expectedPackageId) {
+                    return@withContext AppUpdateCheckResult.Error(
+                        "Release package ID mismatch ($manifestPackageId != $expectedPackageId)."
+                    )
                 }
 
                 val expectedSha256 = if (selectedApk.isDebugAsset) {
@@ -293,7 +311,9 @@ object AppUpdateManager {
                             apkFileName = selectedApk.fileName.ifBlank { "JH-GetWay-$tagName.apk" },
                             apkSizeBytes = selectedApk.sizeBytes,
                             expectedSha256 = expectedSha256,
-                            signingMode = if (selectedApk.isDebugAsset) "debug-persistent" else signingMode
+                            signingMode = if (selectedApk.isDebugAsset) "debug-persistent" else signingMode,
+                            packageId = manifestPackageId,
+                            expectedSigningCertSha256 = if (selectedApk.isDebugAsset) null else signingCertSha256
                         )
                     )
                 } else {
@@ -326,10 +346,13 @@ object AppUpdateManager {
     suspend fun downloadApkWithProgress(
         context: Context,
         release: AppReleaseInfo,
-        onProgress: (Int) -> Unit
+        onProgress: (Int) -> Unit,
+        allowLocalHttpForTesting: Boolean = false
     ): Result<File> = withContext(Dispatchers.IO) {
         runCatching {
-            if (!release.apkDownloadUrl.startsWith("https://")) {
+            val isLocalTestUrl = allowLocalHttpForTesting &&
+                (release.apkDownloadUrl.startsWith("http://127.0.0.1") || release.apkDownloadUrl.startsWith("http://localhost"))
+            if (!release.apkDownloadUrl.startsWith("https://") && !isLocalTestUrl) {
                 throw SecurityException("APK download URL must use HTTPS.")
             }
 
@@ -478,9 +501,43 @@ object AppUpdateManager {
         }.getOrElse { ApkSignatureCheckResult.Unavailable }
     }
 
-    fun launchApkInstaller(context: Context, apkFile: File): ApkInstallLaunchResult {
+    @Suppress("DEPRECATION")
+    fun verifyApkPackageAndSigner(
+        context: Context,
+        apkFile: File,
+        expectedSigningCertSha256: String? = null
+    ): String? {
+        if (!apkFile.exists()) return "Downloaded APK file not found."
+        val pm = context.packageManager
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            PackageManager.GET_SIGNING_CERTIFICATES
+        } else {
+            PackageManager.GET_SIGNATURES
+        }
+        val archiveInfo = pm.getPackageArchiveInfo(apkFile.absolutePath, flags) ?: return null
+        if (!archiveInfo.packageName.isNullOrBlank() && archiveInfo.packageName != context.packageName) {
+            return "APK package ID (${archiveInfo.packageName}) does not match installed app (${context.packageName})."
+        }
+        val expectedNorm = expectedSigningCertSha256?.replace(":", "")?.trim()?.lowercase()
+        if (!expectedNorm.isNullOrBlank()) {
+            val apkDigests = extractSigningDigests(archiveInfo)
+            if (apkDigests.isNotEmpty() && expectedNorm !in apkDigests) {
+                return "APK signing certificate does not match release manifest fingerprint."
+            }
+        }
+        return null
+    }
+
+    fun launchApkInstaller(
+        context: Context,
+        apkFile: File,
+        expectedSigningCertSha256: String? = null
+    ): ApkInstallLaunchResult {
         if (!apkFile.exists()) {
             return ApkInstallLaunchResult.Failed("Downloaded APK file not found.")
+        }
+        verifyApkPackageAndSigner(context, apkFile, expectedSigningCertSha256)?.let { mismatchErr ->
+            return ApkInstallLaunchResult.Failed(mismatchErr)
         }
         when (val sigCheck = verifyApkSignatureMatchesInstalledApp(context, apkFile)) {
             is ApkSignatureCheckResult.Mismatch -> {

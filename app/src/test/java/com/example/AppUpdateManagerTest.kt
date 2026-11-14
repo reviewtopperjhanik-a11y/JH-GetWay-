@@ -150,4 +150,127 @@ class AppUpdateManagerTest {
             server.stop(0)
         }
     }
+
+    @Test
+    fun checkForUpdate_rejectsMismatchedPackageIdAndDebugOnlyReleaseAsset() = runBlocking {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val port = server.address.port
+        server.createContext("/repos/jhsoft/jh-getway/releases/latest") { exchange ->
+            val response = """
+                {
+                  "tag_name": "v1.0.12",
+                  "name": "JH GetWay v1.0.12",
+                  "body": "Permanent signed release",
+                  "html_url": "https://github.com/jhsoft/jh-getway/releases/tag/v1.0.12",
+                  "assets": [
+                    {
+                      "name": "JH-GetWay-v1.0.12-release.apk",
+                      "browser_download_url": "http://127.0.0.1:$port/dl/release.apk",
+                      "size": 10
+                    },
+                    {
+                      "name": "update-manifest.json",
+                      "browser_download_url": "http://127.0.0.1:$port/dl/update-manifest.json",
+                      "size": 250
+                    }
+                  ]
+                }
+            """.trimIndent().toByteArray()
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.sendResponseHeaders(200, response.size.toLong())
+            exchange.responseBody.use { it.write(response) }
+        }
+        server.createContext("/dl/update-manifest.json") { exchange ->
+            val response = """
+                {
+                  "versionCode": 112,
+                  "versionName": "1.0.12",
+                  "tag": "v1.0.12",
+                  "packageId": "com.wrong.package",
+                  "apkName": "JH-GetWay-v1.0.12-release.apk",
+                  "sha256": "abc123",
+                  "signingMode": "production",
+                  "signingCertSha256": "deadbeef"
+                }
+            """.trimIndent().toByteArray()
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.sendResponseHeaders(200, response.size.toLong())
+            exchange.responseBody.use { it.write(response) }
+        }
+        server.start()
+        try {
+            val res = AppUpdateManager.checkForUpdate(
+                repoInput = "jhsoft/jh-getway",
+                currentVersionCode = 111,
+                currentVersionName = "1.0.11",
+                preferDebugApk = false,
+                apiBaseUrl = "http://127.0.0.1:$port",
+                expectedPackageId = "com.aistudio.jhgetway.iffndf"
+            )
+            assertTrue("Expected Error on mismatched packageId, got $res", res is AppUpdateCheckResult.Error)
+            assertTrue((res as AppUpdateCheckResult.Error).message.contains("package ID mismatch"))
+
+            // Also verify preferDebugApk=false never selects a debug APK
+            val debugOnlyAssets = org.json.JSONArray()
+                .put(org.json.JSONObject().put("name", "app-debug.apk").put("browser_download_url", "https://example.com/app-debug.apk").put("size", 100))
+            assertNull(AppUpdateManager.selectPreferredApkAsset(debugOnlyAssets, preferDebugApk = false))
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun downloadApkWithProgress_verifiesSha256AndRejectsCorruptedArtifact() = runBlocking {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val payload = "FAKE-APK-BYTES-FOR-HASH-CHECK".toByteArray()
+        val expectedSha = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(payload)
+            .joinToString("") { "%02x".format(it) }
+
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val port = server.address.port
+        server.createContext("/dl/app.apk") { exchange ->
+            exchange.sendResponseHeaders(200, payload.size.toLong())
+            exchange.responseBody.use { it.write(payload) }
+        }
+        server.start()
+        try {
+            val goodRelease = com.example.updater.AppReleaseInfo(
+                repoSlug = "jhsoft/jh-getway",
+                tagName = "v1.0.12",
+                versionName = "1.0.12",
+                versionCode = 112,
+                releaseTitle = "v1.0.12",
+                releaseNotes = "",
+                htmlUrl = "https://github.com/jhsoft/jh-getway/releases/tag/v1.0.12",
+                publishedAt = "",
+                apkDownloadUrl = "http://127.0.0.1:$port/dl/app.apk",
+                apkFileName = "JH-GetWay-v1.0.12-release.apk",
+                apkSizeBytes = payload.size.toLong(),
+                expectedSha256 = expectedSha,
+                signingMode = "production"
+            )
+            val okResult = AppUpdateManager.downloadApkWithProgress(
+                context = context,
+                release = goodRelease,
+                onProgress = {},
+                allowLocalHttpForTesting = true
+            )
+            assertTrue("Expected download with matching SHA-256 to succeed", okResult.isSuccess)
+            assertTrue(okResult.getOrThrow().exists())
+
+            val badRelease = goodRelease.copy(expectedSha256 = "0".repeat(64))
+            val badResult = AppUpdateManager.downloadApkWithProgress(
+                context = context,
+                release = badRelease,
+                onProgress = {},
+                allowLocalHttpForTesting = true
+            )
+            assertTrue("Expected download with mismatched SHA-256 to fail", badResult.isFailure)
+        } finally {
+            server.stop(0)
+        }
+    }
 }
+
+

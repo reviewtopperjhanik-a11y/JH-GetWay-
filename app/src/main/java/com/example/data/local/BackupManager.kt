@@ -2,8 +2,12 @@ package com.example.data.local
 
 import androidx.annotation.VisibleForTesting
 import androidx.room.withTransaction
+import com.example.BuildConfig
+import com.example.core.i18n.AppLanguage
 import com.example.core.security.CryptoManager
 import com.example.core.security.MaskingUtils
+import com.example.ui.theme.ThemeMode
+import kotlinx.coroutines.flow.first
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -13,6 +17,17 @@ enum class RestoreConflictStrategy {
     SKIP_CONFLICTS,
     REPLACE_ALL
 }
+
+data class BackupManifest(
+    val backupFormatVersion: Int,
+    val schemaVersion: Int,
+    val createdAt: Long,
+    val appVersionName: String,
+    val appVersionCode: Int,
+    val applicationId: String,
+    val includedCategories: List<String> = emptyList(),
+    val nonPortableCategories: List<String> = emptyList()
+)
 
 data class BackupEntityCounts(
     val providers: Int = 0,
@@ -24,11 +39,17 @@ data class BackupEntityCounts(
     val mcpServers: Int = 0,
     val mcpTools: Int = 0,
     val workflows: Int = 0,
-    val devices: Int = 0
+    val devices: Int = 0,
+    val workflowRuns: Int = 0,
+    val playgroundSessions: Int = 0,
+    val playgroundMessages: Int = 0,
+    val requestMetrics: Int = 0,
+    val preferences: Int = 0
 ) {
     val total: Int
         get() = providers + apiKeys + models + routingRules + codingAgents +
-            localAiServers + mcpServers + mcpTools + workflows + devices
+            localAiServers + mcpServers + mcpTools + workflows + devices +
+            workflowRuns + playgroundSessions + playgroundMessages + requestMetrics + preferences
 }
 
 data class BackupConflictSummary(
@@ -41,11 +62,17 @@ data class BackupConflictSummary(
     val mcpServers: Int = 0,
     val mcpTools: Int = 0,
     val workflows: Int = 0,
-    val devices: Int = 0
+    val devices: Int = 0,
+    val workflowRuns: Int = 0,
+    val playgroundSessions: Int = 0,
+    val playgroundMessages: Int = 0,
+    val requestMetrics: Int = 0,
+    val preferences: Int = 0
 ) {
     val totalConflicts: Int
         get() = providers + apiKeys + models + routingRules + codingAgents +
-            localAiServers + mcpServers + mcpTools + workflows + devices
+            localAiServers + mcpServers + mcpTools + workflows + devices +
+            workflowRuns + playgroundSessions + playgroundMessages + requestMetrics + preferences
 }
 
 data class BackupRestorePreview(
@@ -56,22 +83,46 @@ data class BackupRestorePreview(
     val kdfIterations: Int,
     val integrityVerified: Boolean,
     val counts: BackupEntityCounts,
-    val conflicts: BackupConflictSummary
+    val conflicts: BackupConflictSummary,
+    val manifest: BackupManifest? = null
 )
 
 data class RestoreResult(
     val importedCount: Int,
     val skippedConflicts: Int,
     val overwrittenCount: Int,
-    val strategy: RestoreConflictStrategy
+    val strategy: RestoreConflictStrategy,
+    val preferencesRestored: Boolean = false,
+    val nonPortableCategories: List<String> = emptyList()
 )
 
-class BackupManager(private val db: JhGetWayDatabase) {
+class BackupManager(
+    private val db: JhGetWayDatabase,
+    private val prefs: AppPreferences? = null,
+    private val appVersionName: String = BuildConfig.VERSION_NAME,
+    private val appVersionCode: Int = BuildConfig.VERSION_CODE,
+    private val applicationId: String = BuildConfig.APPLICATION_ID
+) {
 
     companion object {
         const val CURRENT_BACKUP_FORMAT_VERSION = 2
         const val CURRENT_DB_SCHEMA_VERSION = 5
+        const val MAX_BACKUP_WORKFLOW_RUNS = 500
+        const val MAX_BACKUP_METRICS = 2000
+
+        val DEFAULT_NON_PORTABLE_CATEGORIES = listOf(
+            "android_keystore_master_key",
+            "app_lock_pin_and_biometric",
+            "playground_attachment_files",
+            "activity_logs",
+            "ephemeral_runtime_state"
+        )
     }
+
+    private data class StagedPreferences(
+        val state: GatewaySettingsState,
+        val remoteAuthTokenPlain: String?
+    )
 
     private data class StagedArchive(
         val formatVersion: Int,
@@ -80,6 +131,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
         val kdfAlgorithm: String,
         val kdfIterations: Int,
         val integrityVerified: Boolean,
+        val manifest: BackupManifest,
         val providers: List<ProviderEntity>,
         val apiKeysPlain: List<Pair<ApiKeyEntity, String>>,
         val models: List<ModelEntity>,
@@ -89,7 +141,12 @@ class BackupManager(private val db: JhGetWayDatabase) {
         val mcpServersPlain: List<Triple<McpServerEntity, String, String>>,
         val mcpTools: List<McpToolEntity>,
         val workflows: List<WorkflowEntity>,
-        val devicesPlain: List<Pair<DeviceEntity, String>>
+        val devicesPlain: List<Pair<DeviceEntity, String>>,
+        val workflowRuns: List<WorkflowRunEntity>,
+        val playgroundSessions: List<PlaygroundSessionEntity>,
+        val playgroundMessages: List<PlaygroundMessageEntity>,
+        val requestMetrics: List<RequestMetricEntity>,
+        val preferences: StagedPreferences?
     ) {
         fun counts(): BackupEntityCounts = BackupEntityCounts(
             providers = providers.size,
@@ -101,7 +158,12 @@ class BackupManager(private val db: JhGetWayDatabase) {
             mcpServers = mcpServersPlain.size,
             mcpTools = mcpTools.size,
             workflows = workflows.size,
-            devices = devicesPlain.size
+            devices = devicesPlain.size,
+            workflowRuns = workflowRuns.size,
+            playgroundSessions = playgroundSessions.size,
+            playgroundMessages = playgroundMessages.size,
+            requestMetrics = requestMetrics.size,
+            preferences = if (preferences != null) 1 else 0
         )
     }
 
@@ -110,7 +172,10 @@ class BackupManager(private val db: JhGetWayDatabase) {
             "Backup passphrase must be at least ${CryptoManager.MIN_BACKUP_V2_PASSPHRASE_LEN} characters"
         }
 
+        val nowMs = System.currentTimeMillis()
         val dataObj = JSONObject()
+        val includedCategories = mutableListOf<String>()
+        val nonPortableCategories = DEFAULT_NON_PORTABLE_CATEGORIES.toMutableList()
 
         val providersArr = JSONArray()
         db.providerDao().getAllOnce().forEach { p ->
@@ -129,6 +194,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
             })
         }
         dataObj.put("providers", providersArr)
+        includedCategories += "providers"
 
         val keysArr = JSONArray()
         db.apiKeyDao().getAllOnce().forEach { k ->
@@ -146,6 +212,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
             })
         }
         dataObj.put("apiKeys", keysArr)
+        includedCategories += "api_keys_reencrypted"
 
         val modelsArr = JSONArray()
         db.modelDao().getAllOnce().forEach { m ->
@@ -177,6 +244,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
             })
         }
         dataObj.put("models", modelsArr)
+        includedCategories += "models"
 
         val rulesArr = JSONArray()
         db.routingRuleDao().getAllOnce().forEach { r ->
@@ -196,6 +264,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
             })
         }
         dataObj.put("routingRules", rulesArr)
+        includedCategories += "routing_rules"
 
         val agentsArr = JSONArray()
         db.codingAgentDao().getAllOnce().forEach { a ->
@@ -216,6 +285,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
             })
         }
         dataObj.put("codingAgents", agentsArr)
+        includedCategories += "coding_agents"
 
         val localServersArr = JSONArray()
         db.localAiServerDao().getAllOnce().forEach { s ->
@@ -234,6 +304,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
             })
         }
         dataObj.put("localAiServers", localServersArr)
+        includedCategories += "local_ai_servers"
 
         val mcpServersArr = JSONArray()
         db.mcpDao().getServersOnce().forEach { s ->
@@ -254,6 +325,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
             })
         }
         dataObj.put("mcpServers", mcpServersArr)
+        includedCategories += "mcp_servers"
 
         val mcpToolsArr = JSONArray()
         db.mcpDao().getServersOnce().forEach { srv ->
@@ -269,6 +341,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
             }
         }
         dataObj.put("mcpTools", mcpToolsArr)
+        includedCategories += "mcp_tools"
 
         val workflowsArr = JSONArray()
         db.workflowDao().getWorkflowsOnce().filter { !it.isTemplate }.forEach { w ->
@@ -282,6 +355,28 @@ class BackupManager(private val db: JhGetWayDatabase) {
             })
         }
         dataObj.put("workflows", workflowsArr)
+        includedCategories += "workflows"
+
+        val workflowRuns = db.workflowDao().getRunsOnce().take(MAX_BACKUP_WORKFLOW_RUNS)
+        if (workflowRuns.isNotEmpty()) {
+            val runsArr = JSONArray()
+            workflowRuns.forEach { r ->
+                runsArr.put(JSONObject().apply {
+                    put("id", r.id)
+                    put("workflowId", r.workflowId)
+                    put("workflowName", r.workflowName)
+                    put("status", r.status)
+                    put("inputText", r.inputText)
+                    put("finalOutput", r.finalOutput)
+                    put("nodeResultsJson", r.nodeResultsJson)
+                    put("startedAt", r.startedAt)
+                    put("finishedAt", r.finishedAt ?: JSONObject.NULL)
+                    put("errorMessage", r.errorMessage ?: JSONObject.NULL)
+                })
+            }
+            dataObj.put("workflowRuns", runsArr)
+            includedCategories += "workflow_runs"
+        }
 
         val devicesArr = JSONArray()
         db.deviceDao().getAllOnce().forEach { d ->
@@ -301,15 +396,160 @@ class BackupManager(private val db: JhGetWayDatabase) {
             })
         }
         dataObj.put("devices", devicesArr)
+        includedCategories += "devices"
+
+        val sessions = db.playgroundDao().getSessionsOnce()
+        if (sessions.isNotEmpty()) {
+            val sessArr = JSONArray()
+            sessions.forEach { s ->
+                sessArr.put(JSONObject().apply {
+                    put("id", s.id)
+                    put("title", s.title)
+                    put("modelId", s.modelId)
+                    put("providerId", s.providerId)
+                    put("systemPrompt", s.systemPrompt)
+                    put("createdAt", s.createdAt)
+                    put("updatedAt", s.updatedAt)
+                })
+            }
+            dataObj.put("playgroundSessions", sessArr)
+            includedCategories += "playground_sessions"
+        }
+
+        val messages = db.playgroundDao().getAllMessagesOnce()
+        if (messages.isNotEmpty()) {
+            val msgArr = JSONArray()
+            messages.forEach { m ->
+                msgArr.put(JSONObject().apply {
+                    put("id", m.id)
+                    put("sessionId", m.sessionId)
+                    put("role", m.role)
+                    put("content", m.content)
+                    put("modelId", m.modelId)
+                    put("providerName", m.providerName)
+                    put("latencyMs", m.latencyMs ?: JSONObject.NULL)
+                    put("inputTokens", m.inputTokens ?: JSONObject.NULL)
+                    put("outputTokens", m.outputTokens ?: JSONObject.NULL)
+                    put("estimatedCostUsd", m.estimatedCostUsd ?: JSONObject.NULL)
+                    put("isError", m.isError)
+                    put("timestamp", m.timestamp)
+                    put("attachmentsMetadataJson", sanitizeAttachmentsMetadataForBackup(m.attachmentsMetadataJson))
+                })
+            }
+            dataObj.put("playgroundMessages", msgArr)
+            includedCategories += "playground_messages"
+        }
+
+        val metrics = db.metricAndLogDao().getMetricsOnce().take(MAX_BACKUP_METRICS)
+        if (metrics.isNotEmpty()) {
+            val metricsArr = JSONArray()
+            metrics.forEach { m ->
+                metricsArr.put(JSONObject().apply {
+                    put("id", m.id)
+                    put("requestId", m.requestId)
+                    put("timestamp", m.timestamp)
+                    put("providerId", m.providerId)
+                    put("providerName", m.providerName)
+                    put("modelId", m.modelId)
+                    put("deviceName", m.deviceName)
+                    put("endpoint", m.endpoint)
+                    put("statusCode", m.statusCode)
+                    put("success", m.success)
+                    put("latencyMs", m.latencyMs)
+                    put("inputTokens", m.inputTokens)
+                    put("outputTokens", m.outputTokens)
+                    put("usageSource", m.usageSource)
+                    put("estimatedCostUsd", m.estimatedCostUsd ?: JSONObject.NULL)
+                    put("actualBilledCostUsd", m.actualBilledCostUsd ?: JSONObject.NULL)
+                    put("pricingSource", m.pricingSource ?: JSONObject.NULL)
+                    put("pricingUpdatedAt", m.pricingUpdatedAt ?: JSONObject.NULL)
+                    put("fallbackAttempts", m.fallbackAttempts)
+                    put("routingMode", m.routingMode)
+                    put("routingReason", m.routingReason)
+                    put("errorCode", m.errorCode ?: JSONObject.NULL)
+                    put("safeErrorMessage", m.safeErrorMessage ?: JSONObject.NULL)
+                })
+            }
+            dataObj.put("requestMetrics", metricsArr)
+            includedCategories += "analytics_metrics"
+        }
+
+        if (prefs != null) {
+            val s = prefs.settingsFlow.first()
+            var remoteTokenPlain: String? = null
+            if (s.gatewayRemoteAuthTokenEnc.isNotBlank()) {
+                val dec = runCatching { CryptoManager.decrypt(s.gatewayRemoteAuthTokenEnc) }.getOrNull()
+                if (dec != null) {
+                    remoteTokenPlain = dec
+                } else {
+                    nonPortableCategories += "gateway_remote_auth_token"
+                }
+            }
+            dataObj.put("preferences", JSONObject().apply {
+                put("themeMode", s.themeMode.name)
+                put("language", s.language.name)
+                put("onboardingCompleted", s.onboardingCompleted)
+                put("gatewayName", s.gatewayName)
+                put("gatewayMode", s.gatewayMode.name)
+                put("gatewayHost", s.gatewayHost)
+                put("gatewayPort", s.gatewayPort)
+                put("gatewayRemoteUrl", s.gatewayRemoteUrl)
+                put("gatewayAuthRequired", s.gatewayAuthRequired)
+                put("gatewayTimeoutSec", s.gatewayTimeoutSec)
+                put("gatewayMaxRequestKb", s.gatewayMaxRequestKb)
+                put("gatewayStreamingEnabled", s.gatewayStreamingEnabled)
+                put("gatewayRateLimitPerMin", s.gatewayRateLimitPerMin)
+                put("gatewayLoggingLevel", s.gatewayLoggingLevel.name)
+                put("gatewayAllowLanExposure", s.gatewayAllowLanExposure)
+                if (remoteTokenPlain != null) {
+                    put("gatewayRemoteAuthTokenPlain", remoteTokenPlain)
+                }
+                put("defaultModelId", s.defaultModelId)
+                put("defaultProviderId", s.defaultProviderId)
+                put("defaultRoutingMode", s.defaultRoutingMode.name)
+                put("fallbackEnabled", s.fallbackEnabled)
+                put("maxRetries", s.maxRetries)
+                put("localRoutingPolicy", s.localRoutingPolicy.name)
+                put("allowCloudFallbackForLocal", s.allowCloudFallbackForLocal)
+                put("localNetworkAccessAllowed", s.localNetworkAccessAllowed)
+                put("saveChatHistoryAllowed", s.saveChatHistoryAllowed)
+                put("analyticsCurrency", s.analyticsCurrency)
+                put("logRetentionDays", s.logRetentionDays)
+                put("usageRetentionDays", s.usageRetentionDays)
+                put("playgroundRetentionDays", s.playgroundRetentionDays)
+                put("notifyProviderFailure", s.notifyProviderFailure)
+                put("notifyGatewayDisconnected", s.notifyGatewayDisconnected)
+                put("notifyRateLimit", s.notifyRateLimit)
+                put("notifyWorkflowCompleted", s.notifyWorkflowCompleted)
+                put("notifySecurityEvent", s.notifySecurityEvent)
+                put("githubUpdateRepo", s.githubUpdateRepo)
+                put("autoCheckUpdates", s.autoCheckUpdates)
+                put("manualModelFallbackEnabled", s.manualModelFallbackEnabled)
+                put("autoFreeIncludeLocal", s.autoFreeIncludeLocal)
+            })
+            includedCategories += "preferences"
+        }
+
+        val manifestObj = JSONObject().apply {
+            put("backupFormatVersion", CURRENT_BACKUP_FORMAT_VERSION)
+            put("schemaVersion", CURRENT_DB_SCHEMA_VERSION)
+            put("createdAt", nowMs)
+            put("appVersionName", appVersionName)
+            put("appVersionCode", appVersionCode)
+            put("applicationId", applicationId)
+            put("includedCategories", JSONArray(includedCategories))
+            put("nonPortableCategories", JSONArray(nonPortableCategories.distinct()))
+        }
 
         val integrityDigest = sha256Hex(canonicalJson(dataObj))
         val root = JSONObject().apply {
             put("backupFormatVersion", CURRENT_BACKUP_FORMAT_VERSION)
             put("version", CURRENT_BACKUP_FORMAT_VERSION)
             put("schemaVersion", CURRENT_DB_SCHEMA_VERSION)
-            put("exportedAt", System.currentTimeMillis())
+            put("exportedAt", nowMs)
             put("kdf", "PBKDF2WithHmacSHA256")
             put("kdfIterations", CryptoManager.BENCHMARKED_BACKUP_KDF_ITERATIONS)
+            put("manifest", manifestObj)
             put("integritySha256", integrityDigest)
             put("data", dataObj)
         }
@@ -328,7 +568,8 @@ class BackupManager(private val db: JhGetWayDatabase) {
             kdfIterations = staged.kdfIterations,
             integrityVerified = staged.integrityVerified,
             counts = staged.counts(),
-            conflicts = conflicts
+            conflicts = conflicts,
+            manifest = staged.manifest
         )
     }
 
@@ -380,8 +621,11 @@ class BackupManager(private val db: JhGetWayDatabase) {
         val reEncryptedDevices = staged.devicesPlain.map { (entity, plainToken) ->
             entity.copy(encryptedToken = CryptoManager.encrypt(plainToken))
         }
+        val reEncryptedRemoteGatewayToken = staged.preferences?.remoteAuthTokenPlain?.let { plain ->
+            if (plain.isNotBlank()) CryptoManager.encrypt(plain) else ""
+        }
 
-        return db.withTransaction {
+        val dbCounts = db.withTransaction {
             var importedCount = 0
             var skippedConflicts = 0
             var overwrittenCount = 0
@@ -395,7 +639,11 @@ class BackupManager(private val db: JhGetWayDatabase) {
             val existingMcpServerIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.mcpDao().getServersOnce().map { it.id }.toSet()
             val existingMcpToolIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.mcpDao().getServersOnce().flatMap { db.mcpDao().getToolsForServer(it.id) }.map { it.id }.toSet()
             val existingWorkflowIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.workflowDao().getWorkflowsOnce().map { it.id }.toSet()
+            val existingWorkflowRunIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.workflowDao().getRunsOnce().map { it.id }.toSet()
             val existingDeviceIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.deviceDao().getAllOnce().map { it.id }.toSet()
+            val existingSessionIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.playgroundDao().getSessionsOnce().map { it.id }.toSet()
+            val existingMessageIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.playgroundDao().getAllMessagesOnce().map { it.id }.toSet()
+            val existingMetricIds = if (strategy == RestoreConflictStrategy.REPLACE_ALL) emptySet() else db.metricAndLogDao().getMetricsOnce().map { it.id }.toSet()
 
             if (strategy == RestoreConflictStrategy.REPLACE_ALL) {
                 val templatesToPreserve = db.workflowDao().getWorkflowsOnce().filter { it.isTemplate }
@@ -407,8 +655,12 @@ class BackupManager(private val db: JhGetWayDatabase) {
                 db.localAiServerDao().clearAll()
                 db.mcpDao().clearTools()
                 db.mcpDao().clearServers()
+                db.workflowDao().clearRuns()
                 db.workflowDao().clearWorkflows()
                 db.deviceDao().clearAll()
+                db.playgroundDao().clearMessages()
+                db.playgroundDao().clearSessions()
+                db.metricAndLogDao().clearMetrics()
                 templatesToPreserve.forEach { db.workflowDao().upsertWorkflow(it) }
             }
 
@@ -502,6 +754,16 @@ class BackupManager(private val db: JhGetWayDatabase) {
                     importedCount++
                 }
             }
+            for (run in staged.workflowRuns) {
+                val collides = run.id in existingWorkflowRunIds
+                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                    skippedConflicts++
+                } else {
+                    if (collides) overwrittenCount++
+                    db.workflowDao().upsertRun(run)
+                    importedCount++
+                }
+            }
             for (d in reEncryptedDevices) {
                 val collides = d.id in existingDeviceIds
                 if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
@@ -512,16 +774,73 @@ class BackupManager(private val db: JhGetWayDatabase) {
                     importedCount++
                 }
             }
+            for (sess in staged.playgroundSessions) {
+                val collides = sess.id in existingSessionIds
+                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                    skippedConflicts++
+                } else {
+                    if (collides) overwrittenCount++
+                    db.playgroundDao().upsertSession(sess)
+                    importedCount++
+                }
+            }
+            for (msg in staged.playgroundMessages) {
+                val collides = msg.id in existingMessageIds
+                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                    skippedConflicts++
+                } else {
+                    if (collides) overwrittenCount++
+                    db.playgroundDao().insertMessage(msg)
+                    importedCount++
+                }
+            }
+            for (metric in staged.requestMetrics) {
+                val collides = metric.id in existingMetricIds
+                if (collides && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                    skippedConflicts++
+                } else {
+                    if (collides) overwrittenCount++
+                    db.metricAndLogDao().insertMetric(metric)
+                    importedCount++
+                }
+            }
 
             beforeCommitHook?.invoke()
 
-            RestoreResult(
-                importedCount = importedCount,
-                skippedConflicts = skippedConflicts,
-                overwrittenCount = overwrittenCount,
-                strategy = strategy
-            )
+            Triple(importedCount, skippedConflicts, overwrittenCount)
         }
+
+        var importedCount = dbCounts.first
+        var skippedConflicts = dbCounts.second
+        var overwrittenCount = dbCounts.third
+        var preferencesRestored = false
+
+        if (staged.preferences != null && prefs != null) {
+            val existingSettings = prefs.settingsFlow.first()
+            val hasPrefConflict = hasCustomizedPortablePreferences(existingSettings)
+            if (hasPrefConflict && strategy == RestoreConflictStrategy.SKIP_CONFLICTS) {
+                skippedConflicts++
+            } else {
+                if (hasPrefConflict && strategy != RestoreConflictStrategy.REPLACE_ALL) {
+                    overwrittenCount++
+                }
+                prefs.restorePortablePreferences(
+                    snapshot = staged.preferences.state,
+                    remoteAuthTokenEnc = reEncryptedRemoteGatewayToken
+                )
+                importedCount++
+                preferencesRestored = true
+            }
+        }
+
+        return RestoreResult(
+            importedCount = importedCount,
+            skippedConflicts = skippedConflicts,
+            overwrittenCount = overwrittenCount,
+            strategy = strategy,
+            preferencesRestored = preferencesRestored,
+            nonPortableCategories = staged.manifest.nonPortableCategories
+        )
     }
 
     private suspend fun computeConflicts(staged: StagedArchive): BackupConflictSummary {
@@ -534,7 +853,14 @@ class BackupManager(private val db: JhGetWayDatabase) {
         val mcpServerIds = db.mcpDao().getServersOnce().map { it.id }.toSet()
         val mcpToolIds = db.mcpDao().getServersOnce().flatMap { db.mcpDao().getToolsForServer(it.id) }.map { it.id }.toSet()
         val workflowIds = db.workflowDao().getWorkflowsOnce().map { it.id }.toSet()
+        val workflowRunIds = db.workflowDao().getRunsOnce().map { it.id }.toSet()
         val deviceIds = db.deviceDao().getAllOnce().map { it.id }.toSet()
+        val sessionIds = db.playgroundDao().getSessionsOnce().map { it.id }.toSet()
+        val messageIds = db.playgroundDao().getAllMessagesOnce().map { it.id }.toSet()
+        val metricIds = db.metricAndLogDao().getMetricsOnce().map { it.id }.toSet()
+        val prefConflict = if (staged.preferences != null && prefs != null) {
+            if (hasCustomizedPortablePreferences(prefs.settingsFlow.first())) 1 else 0
+        } else 0
 
         return BackupConflictSummary(
             providers = staged.providers.count { it.id in providerIds },
@@ -546,8 +872,27 @@ class BackupManager(private val db: JhGetWayDatabase) {
             mcpServers = staged.mcpServersPlain.count { it.first.id in mcpServerIds },
             mcpTools = staged.mcpTools.count { it.id in mcpToolIds },
             workflows = staged.workflows.count { it.id in workflowIds },
-            devices = staged.devicesPlain.count { it.first.id in deviceIds }
+            devices = staged.devicesPlain.count { it.first.id in deviceIds },
+            workflowRuns = staged.workflowRuns.count { it.id in workflowRunIds },
+            playgroundSessions = staged.playgroundSessions.count { it.id in sessionIds },
+            playgroundMessages = staged.playgroundMessages.count { it.id in messageIds },
+            requestMetrics = staged.requestMetrics.count { it.id in metricIds },
+            preferences = prefConflict
         )
+    }
+
+    private fun hasCustomizedPortablePreferences(current: GatewaySettingsState): Boolean {
+        val baseline = GatewaySettingsState()
+        return current.copy(
+            appLockEnabled = baseline.appLockEnabled,
+            appLockPinHash = baseline.appLockPinHash,
+            appLockFailedAttempts = baseline.appLockFailedAttempts,
+            appLockLockedUntilMs = baseline.appLockLockedUntilMs,
+            appLockAutoLockOnBackground = baseline.appLockAutoLockOnBackground,
+            appLockBiometricEnabled = baseline.appLockBiometricEnabled,
+            gatewayServiceDesiredRunning = baseline.gatewayServiceDesiredRunning,
+            skippedUpdateTag = baseline.skippedUpdateTag
+        ) != baseline
     }
 
     private fun parseAndValidateArchive(encryptedPayload: String, passphrase: String): StagedArchive {
@@ -562,6 +907,12 @@ class BackupManager(private val db: JhGetWayDatabase) {
         }
         val schemaVersion = root.optInt("schemaVersion", if (formatVersion == 1) 1 else CURRENT_DB_SCHEMA_VERSION)
         val exportedAt = root.optLong("exportedAt", 0L)
+
+        val manifestJson = root.optJSONObject("manifest")
+        val manifestAppId = manifestJson?.optString("applicationId", "")?.trim().orEmpty()
+        if (manifestAppId.isNotBlank() && manifestAppId != applicationId) {
+            throw IllegalArgumentException("Backup belongs to a different application ID ($manifestAppId).")
+        }
 
         val dataObj: JSONObject
         val integrityVerified: Boolean
@@ -829,6 +1180,28 @@ class BackupManager(private val db: JhGetWayDatabase) {
             }
         }
 
+        val workflowRuns = buildList {
+            dataObj.optJSONArray("workflowRuns")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: throw IllegalArgumentException("Invalid workflow run record at index $i")
+                    add(
+                        WorkflowRunEntity(
+                            id = o.requireNonBlank("id", "workflowRun"),
+                            workflowId = o.requireNonBlank("workflowId", "workflowRun"),
+                            workflowName = o.optString("workflowName", "Workflow"),
+                            status = o.optString("status", "COMPLETED"),
+                            inputText = o.optString("inputText"),
+                            finalOutput = o.optString("finalOutput"),
+                            nodeResultsJson = o.optString("nodeResultsJson", "[]"),
+                            startedAt = o.optLong("startedAt", System.currentTimeMillis()),
+                            finishedAt = if (o.isNull("finishedAt") || !o.has("finishedAt")) null else o.optLong("finishedAt"),
+                            errorMessage = if (o.isNull("errorMessage") || !o.has("errorMessage")) null else o.optString("errorMessage")
+                        )
+                    )
+                }
+            }
+        }
+
         val devicesPlain = buildList {
             dataObj.optJSONArray("devices")?.let { arr ->
                 for (i in 0 until arr.length()) {
@@ -854,6 +1227,141 @@ class BackupManager(private val db: JhGetWayDatabase) {
             }
         }
 
+        val playgroundSessions = buildList {
+            dataObj.optJSONArray("playgroundSessions")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: throw IllegalArgumentException("Invalid playground session record at index $i")
+                    add(
+                        PlaygroundSessionEntity(
+                            id = o.requireNonBlank("id", "playgroundSession"),
+                            title = o.optString("title", "Chat"),
+                            modelId = o.optString("modelId"),
+                            providerId = o.optString("providerId"),
+                            systemPrompt = o.optString("systemPrompt"),
+                            createdAt = o.optLong("createdAt", System.currentTimeMillis()),
+                            updatedAt = o.optLong("updatedAt", System.currentTimeMillis())
+                        )
+                    )
+                }
+            }
+        }
+
+        val playgroundMessages = buildList {
+            dataObj.optJSONArray("playgroundMessages")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: throw IllegalArgumentException("Invalid playground message record at index $i")
+                    add(
+                        PlaygroundMessageEntity(
+                            id = o.requireNonBlank("id", "playgroundMessage"),
+                            sessionId = o.requireNonBlank("sessionId", "playgroundMessage"),
+                            role = o.optString("role", "user"),
+                            content = o.optString("content"),
+                            modelId = o.optString("modelId"),
+                            providerName = o.optString("providerName"),
+                            latencyMs = if (o.isNull("latencyMs") || !o.has("latencyMs")) null else o.optLong("latencyMs"),
+                            inputTokens = if (o.isNull("inputTokens") || !o.has("inputTokens")) null else o.optInt("inputTokens"),
+                            outputTokens = if (o.isNull("outputTokens") || !o.has("outputTokens")) null else o.optInt("outputTokens"),
+                            estimatedCostUsd = if (o.isNull("estimatedCostUsd") || !o.has("estimatedCostUsd")) null else o.optDouble("estimatedCostUsd"),
+                            isError = o.optBoolean("isError", false),
+                            timestamp = o.optLong("timestamp", System.currentTimeMillis()),
+                            attachmentsMetadataJson = sanitizeAttachmentsMetadataForBackup(o.optString("attachmentsMetadataJson", "[]"))
+                        )
+                    )
+                }
+            }
+        }
+
+        val requestMetrics = buildList {
+            dataObj.optJSONArray("requestMetrics")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: throw IllegalArgumentException("Invalid metric record at index $i")
+                    add(
+                        RequestMetricEntity(
+                            id = o.requireNonBlank("id", "requestMetric"),
+                            requestId = o.requireNonBlank("requestId", "requestMetric"),
+                            timestamp = o.optLong("timestamp", System.currentTimeMillis()),
+                            providerId = o.optString("providerId"),
+                            providerName = o.optString("providerName"),
+                            modelId = o.optString("modelId"),
+                            deviceName = o.optString("deviceName", "Local Playground"),
+                            endpoint = o.optString("endpoint", "/v1/chat/completions"),
+                            statusCode = o.optInt("statusCode", 200),
+                            success = o.optBoolean("success", true),
+                            latencyMs = o.optLong("latencyMs", 0L),
+                            inputTokens = o.optInt("inputTokens", 0),
+                            outputTokens = o.optInt("outputTokens", 0),
+                            usageSource = o.optString("usageSource", "UNKNOWN"),
+                            estimatedCostUsd = if (o.isNull("estimatedCostUsd") || !o.has("estimatedCostUsd")) null else o.optDouble("estimatedCostUsd"),
+                            actualBilledCostUsd = if (o.isNull("actualBilledCostUsd") || !o.has("actualBilledCostUsd")) null else o.optDouble("actualBilledCostUsd"),
+                            pricingSource = if (o.isNull("pricingSource") || !o.has("pricingSource")) null else o.optString("pricingSource"),
+                            pricingUpdatedAt = if (o.isNull("pricingUpdatedAt") || !o.has("pricingUpdatedAt")) null else o.optString("pricingUpdatedAt"),
+                            fallbackAttempts = o.optInt("fallbackAttempts", 0),
+                            routingMode = o.optString("routingMode", "AUTOMATIC"),
+                            routingReason = o.optString("routingReason"),
+                            errorCode = if (o.isNull("errorCode") || !o.has("errorCode")) null else o.optString("errorCode"),
+                            safeErrorMessage = if (o.isNull("safeErrorMessage") || !o.has("safeErrorMessage")) null else o.optString("safeErrorMessage")
+                        )
+                    )
+                }
+            }
+        }
+
+        val preferences = dataObj.optJSONObject("preferences")?.let { o ->
+            val state = GatewaySettingsState(
+                themeMode = parseEnum(o.optString("themeMode"), ThemeMode.SYSTEM),
+                language = parseEnum(o.optString("language"), AppLanguage.ENGLISH),
+                onboardingCompleted = o.optBoolean("onboardingCompleted", false),
+                gatewayName = o.optString("gatewayName", "JH GetWay Primary"),
+                gatewayMode = parseEnum(o.optString("gatewayMode"), GatewayMode.LOCAL),
+                gatewayHost = o.optString("gatewayHost", "127.0.0.1"),
+                gatewayPort = o.optInt("gatewayPort", 8787).coerceIn(1024, 65535),
+                gatewayRemoteUrl = o.optString("gatewayRemoteUrl", ""),
+                gatewayAuthRequired = o.optBoolean("gatewayAuthRequired", true),
+                gatewayTimeoutSec = o.optInt("gatewayTimeoutSec", 60),
+                gatewayMaxRequestKb = o.optInt("gatewayMaxRequestKb", 2048),
+                gatewayStreamingEnabled = o.optBoolean("gatewayStreamingEnabled", true),
+                gatewayRateLimitPerMin = o.optInt("gatewayRateLimitPerMin", 60),
+                gatewayLoggingLevel = parseEnum(o.optString("gatewayLoggingLevel"), LoggingLevel.METADATA_ONLY),
+                gatewayAllowLanExposure = o.optBoolean("gatewayAllowLanExposure", false),
+                defaultModelId = o.optString("defaultModelId", ""),
+                defaultProviderId = o.optString("defaultProviderId", ""),
+                defaultRoutingMode = parseEnum(o.optString("defaultRoutingMode"), RoutingMode.AUTOMATIC),
+                fallbackEnabled = o.optBoolean("fallbackEnabled", true),
+                maxRetries = o.optInt("maxRetries", 2),
+                localRoutingPolicy = parseEnum(o.optString("localRoutingPolicy"), LocalRoutingPolicy.LOCAL_CLOUD_FALLBACK),
+                allowCloudFallbackForLocal = o.optBoolean("allowCloudFallbackForLocal", true),
+                localNetworkAccessAllowed = o.optBoolean("localNetworkAccessAllowed", false),
+                saveChatHistoryAllowed = o.optBoolean("saveChatHistoryAllowed", true),
+                analyticsCurrency = o.optString("analyticsCurrency", "USD"),
+                logRetentionDays = o.optInt("logRetentionDays", 30),
+                usageRetentionDays = o.optInt("usageRetentionDays", 90),
+                playgroundRetentionDays = o.optInt("playgroundRetentionDays", 60),
+                notifyProviderFailure = o.optBoolean("notifyProviderFailure", true),
+                notifyGatewayDisconnected = o.optBoolean("notifyGatewayDisconnected", true),
+                notifyRateLimit = o.optBoolean("notifyRateLimit", true),
+                notifyWorkflowCompleted = o.optBoolean("notifyWorkflowCompleted", true),
+                notifySecurityEvent = o.optBoolean("notifySecurityEvent", true),
+                githubUpdateRepo = o.optString("githubUpdateRepo", ""),
+                autoCheckUpdates = o.optBoolean("autoCheckUpdates", true),
+                manualModelFallbackEnabled = o.optBoolean("manualModelFallbackEnabled", false),
+                autoFreeIncludeLocal = o.optBoolean("autoFreeIncludeLocal", false)
+            )
+            val remotePlain = o.optString("gatewayRemoteAuthTokenPlain").takeIf { o.has("gatewayRemoteAuthTokenPlain") && it.isNotBlank() }
+            StagedPreferences(state = state, remoteAuthTokenPlain = remotePlain)
+        }
+
+        val manifest = BackupManifest(
+            backupFormatVersion = manifestJson?.optInt("backupFormatVersion", formatVersion) ?: formatVersion,
+            schemaVersion = manifestJson?.optInt("schemaVersion", schemaVersion) ?: schemaVersion,
+            createdAt = manifestJson?.optLong("createdAt", exportedAt) ?: exportedAt,
+            appVersionName = manifestJson?.optString("appVersionName", "") ?: "",
+            appVersionCode = manifestJson?.optInt("appVersionCode", 0) ?: 0,
+            applicationId = manifestAppId,
+            includedCategories = manifestJson?.optJSONArray("includedCategories")?.toStringList() ?: emptyList(),
+            nonPortableCategories = manifestJson?.optJSONArray("nonPortableCategories")?.toStringList()
+                ?: DEFAULT_NON_PORTABLE_CATEGORIES
+        )
+
         return StagedArchive(
             formatVersion = formatVersion,
             schemaVersion = schemaVersion,
@@ -861,6 +1369,7 @@ class BackupManager(private val db: JhGetWayDatabase) {
             kdfAlgorithm = envelope.kdfAlgorithm,
             kdfIterations = envelope.kdfIterations,
             integrityVerified = integrityVerified,
+            manifest = manifest,
             providers = providers,
             apiKeysPlain = apiKeysPlain,
             models = models,
@@ -870,8 +1379,40 @@ class BackupManager(private val db: JhGetWayDatabase) {
             mcpServersPlain = mcpServersPlain,
             mcpTools = mcpTools,
             workflows = workflows,
-            devicesPlain = devicesPlain
+            devicesPlain = devicesPlain,
+            workflowRuns = workflowRuns,
+            playgroundSessions = playgroundSessions,
+            playgroundMessages = playgroundMessages,
+            requestMetrics = requestMetrics,
+            preferences = preferences
         )
+    }
+
+    private fun sanitizeAttachmentsMetadataForBackup(rawJson: String): String {
+        if (rawJson.isBlank() || rawJson == "[]") return "[]"
+        return runCatching {
+            val arr = JSONArray(rawJson)
+            val sanitized = JSONArray()
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                sanitized.put(JSONObject().apply {
+                    put("id", obj.optString("id"))
+                    put("displayName", obj.optString("displayName", "file"))
+                    put("mimeType", obj.optString("mimeType", "application/octet-stream"))
+                    put("sizeBytes", obj.optLong("sizeBytes", 0L))
+                    put("category", obj.optString("category", AttachmentCategory.DOCUMENT.name))
+                    put("localFilePath", "")
+                })
+            }
+            sanitized.toString()
+        }.getOrDefault("[]")
+    }
+
+    private fun JSONArray.toStringList(): List<String> = buildList {
+        for (i in 0 until length()) {
+            val v = optString(i, "").trim()
+            if (v.isNotEmpty()) add(v)
+        }
     }
 
     private fun JSONObject.requireNonBlank(key: String, entityLabel: String): String {

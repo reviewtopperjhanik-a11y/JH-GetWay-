@@ -45,7 +45,7 @@ Built by **JH Soft Corporation**
 
 - **UI**: Jetpack Compose + Material Design 3 + Navigation Compose (`app/src/main/java/com/example/ui/`)
 - **State**: `GatewayViewModel` (`StateFlow` / `MutableStateFlow`) + `AppPreferences` (`DataStore`)
-- **Storage**: AndroidX Room (`JhGetWayDatabase`, schema v4 with exported schemas under `app/schemas/`)
+- **Storage**: AndroidX Room (`JhGetWayDatabase`, schema v5 with exported schemas under `app/schemas/`)
 - **Networking**: OkHttp 4 (`ProviderHttpClient`, `McpHttpClient`) with SSRF & DNS-rebinding protection (`NetworkAddressClassifier.validateEndpointSecurity` & `pinnedSafeDns`), Ktor CIO (`LocalGatewayHttpServer`)
 - **Security**: `CryptoManager` (Android Keystore AES-256-GCM), `AppLockManager` (PBKDF2 + Biometric), `AccessControl` (`DeviceScopePolicy`), `MaskingUtils`
 
@@ -61,17 +61,14 @@ gradle :app:compileDebugKotlin
 gradle :app:testDebugUnitTest --console=plain
 ```
 
-### Automatic GitHub APK Builds & Releases
-Every push to `main`, `master`, or any `v*` tag triggers `.github/workflows/android-release.yml`, which:
-1. Runs all JVM and Robolectric unit tests (`:app:testDebugUnitTest`).
-2. Automatically increments `versionCode` (`100 + run_number`) and `versionName` (`1.0.<run_number>` or tag name) and embeds `GITHUB_REPOSITORY` into `BuildConfig.GITHUB_REPO`.
-3. Builds signed release and debug APKs (`JH-GetWay-v*-release.apk`) plus `update-manifest.json` (with SHA-256 checksum).
-4. Publishes a **GitHub Release** with the APK and manifest attached.
-
-For seamless in-place updates on Android devices without uninstalling, configure these optional repository secrets in **GitHub -> Settings -> Secrets and variables -> Actions**:
-- `KEYSTORE_BASE64`: Base64-encoded `.jks` keystore (`keyAlias = upload`)
-- `STORE_PASSWORD`: Keystore password
-- `KEY_PASSWORD`: Key password
+### Tag-Based Production GitHub Releases (Fail-Closed Signing)
+- Pushes and pull requests on `main`/`master` run the complete unit & Robolectric test suite (`:app:testDebugUnitTest` and `:app:assembleDebug`) **without** publishing releases.
+- Explicit version tags (`v*`, e.g., `v1.0.12`) trigger `.github/workflows/android-release.yml`, which:
+  1. Runs the complete test suite (`:app:testDebugUnitTest`).
+  2. Verifies tag format, prevents tag reuse, and enforces `versionCode > 111` (and strictly greater than prior published releases).
+  3. Fails closed unless permanent signing secrets (`KEYSTORE_BASE64`, `STORE_PASSWORD`, `KEY_PASSWORD`) are configured for key alias `upload` in **GitHub -> Settings -> Secrets and variables -> Actions** (optional `EXPECTED_SIGNING_SHA256` variable pins the exact certificate fingerprint).
+  4. Builds `:app:assembleRelease`, verifies package ID (`com.aistudio.jhgetway.iffndf`), `versionCode`, and signer certificate with `aapt2` and `apksigner`.
+  5. Publishes `JH-GetWay-v*-release.apk`, `update-manifest.json`, and `SHA256SUMS.txt` (never debug APKs).
 
 ### Mobile In-App Updates
 APKs built by the GitHub workflow automatically know their repository slug (`BuildConfig.GITHUB_REPO`) and check GitHub Releases on launch (or manually via **Settings -> App Updates (GitHub Releases)**), download the new APK with SHA-256 verification, and launch the Android package installer.

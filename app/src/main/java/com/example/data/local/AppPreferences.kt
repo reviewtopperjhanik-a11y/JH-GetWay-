@@ -293,7 +293,54 @@ class AppPreferences(private val context: Context) {
         it[Keys.AUTO_FREE_INCLUDE_LOCAL] = enabled
     }
 
+    suspend fun restorePortablePreferences(
+        snapshot: GatewaySettingsState,
+        remoteAuthTokenEnc: String?
+    ) = context.dataStore.edit { p ->
+        p[Keys.THEME_MODE] = snapshot.themeMode.name
+        p[Keys.LANGUAGE] = snapshot.language.name
+        p[Keys.ONBOARDING_COMPLETED] = snapshot.onboardingCompleted
+        p[Keys.GATEWAY_NAME] = snapshot.gatewayName
+        p[Keys.GATEWAY_MODE] = snapshot.gatewayMode.name
+        p[Keys.GATEWAY_HOST] = snapshot.gatewayHost
+        p[Keys.GATEWAY_PORT] = snapshot.gatewayPort
+        p[Keys.GATEWAY_REMOTE_URL] = snapshot.gatewayRemoteUrl
+        p[Keys.GATEWAY_AUTH_REQUIRED] = snapshot.gatewayAuthRequired
+        p[Keys.GATEWAY_TIMEOUT_SEC] = snapshot.gatewayTimeoutSec
+        p[Keys.GATEWAY_MAX_REQ_KB] = snapshot.gatewayMaxRequestKb
+        p[Keys.GATEWAY_STREAMING] = snapshot.gatewayStreamingEnabled
+        p[Keys.GATEWAY_RATE_LIMIT] = snapshot.gatewayRateLimitPerMin
+        p[Keys.GATEWAY_LOGGING_LEVEL] = snapshot.gatewayLoggingLevel.name
+        p[Keys.GATEWAY_ALLOW_LAN] = snapshot.gatewayAllowLanExposure
+        if (remoteAuthTokenEnc != null) {
+            p[Keys.GATEWAY_REMOTE_TOKEN_ENC] = remoteAuthTokenEnc
+        }
+        p[Keys.DEFAULT_MODEL_ID] = snapshot.defaultModelId
+        p[Keys.DEFAULT_PROVIDER_ID] = snapshot.defaultProviderId
+        p[Keys.DEFAULT_ROUTING_MODE] = snapshot.defaultRoutingMode.name
+        p[Keys.FALLBACK_ENABLED] = snapshot.fallbackEnabled
+        p[Keys.MAX_RETRIES] = snapshot.maxRetries
+        p[Keys.LOCAL_ROUTING_POLICY] = snapshot.localRoutingPolicy.name
+        p[Keys.ALLOW_CLOUD_FALLBACK] = snapshot.allowCloudFallbackForLocal
+        p[Keys.LOCAL_NETWORK_ALLOWED] = snapshot.localNetworkAccessAllowed
+        p[Keys.SAVE_CHAT_HISTORY] = snapshot.saveChatHistoryAllowed
+        p[Keys.ANALYTICS_CURRENCY] = snapshot.analyticsCurrency
+        p[Keys.LOG_RETENTION_DAYS] = snapshot.logRetentionDays
+        p[Keys.USAGE_RETENTION_DAYS] = snapshot.usageRetentionDays
+        p[Keys.PLAYGROUND_RETENTION_DAYS] = snapshot.playgroundRetentionDays
+        p[Keys.NOTIFY_PROVIDER_FAILURE] = snapshot.notifyProviderFailure
+        p[Keys.NOTIFY_GATEWAY_DISC] = snapshot.notifyGatewayDisconnected
+        p[Keys.NOTIFY_RATE_LIMIT] = snapshot.notifyRateLimit
+        p[Keys.NOTIFY_WORKFLOW_DONE] = snapshot.notifyWorkflowCompleted
+        p[Keys.NOTIFY_SECURITY] = snapshot.notifySecurityEvent
+        p[Keys.GITHUB_UPDATE_REPO] = snapshot.githubUpdateRepo
+        p[Keys.AUTO_CHECK_UPDATES] = snapshot.autoCheckUpdates
+        p[Keys.MANUAL_MODEL_FALLBACK] = snapshot.manualModelFallbackEnabled
+        p[Keys.AUTO_FREE_INCLUDE_LOCAL] = snapshot.autoFreeIncludeLocal
+    }
+
     suspend fun clearAll() {
         context.dataStore.edit { it.clear() }
     }
 }
+

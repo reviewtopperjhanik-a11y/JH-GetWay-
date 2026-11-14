@@ -15,7 +15,16 @@ class GeminiProviderAdapter : ProviderAdapter {
     override val apiFormat: ApiFormat = ApiFormat.GEMINI
 
     override fun capabilitiesForModel(modelId: String, modelEntity: ModelEntity?): ProviderCapabilities {
-        val isEmbed = modelId.contains("embed", ignoreCase = true)
+        val lower = modelId.lowercase()
+        val isEmbed = lower.contains("embed")
+        val inferredVision = !isEmbed && (
+            lower.contains("gemini-1.5") ||
+                lower.contains("gemini-2") ||
+                lower.contains("gemini-3") ||
+                lower.contains("gemini-pro-vision") ||
+                lower.contains("vision") ||
+                lower.contains("gemma-3")
+            )
         return ProviderCapabilities(
             supportsTools = !isEmbed && (modelEntity?.supportsTools ?: true),
             supportsToolChoice = !isEmbed && (modelEntity?.supportsTools ?: true),
@@ -23,7 +32,7 @@ class GeminiProviderAdapter : ProviderAdapter {
             supportsStreaming = !isEmbed && (modelEntity?.supportsStreaming ?: true),
             supportsSystemRole = true,
             supportsDeveloperRole = false,
-            supportsVision = !isEmbed && (modelEntity?.supportsVision ?: true),
+            supportsVision = !isEmbed && (modelEntity == null || modelEntity.supportsVision || inferredVision),
             supportsStopSequences = true,
             supportsDocumentFiles = !isEmbed,
             supportedDocumentMimeTypes = if (isEmbed) emptySet() else setOf(

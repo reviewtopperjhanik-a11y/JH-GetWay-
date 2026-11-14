@@ -24,7 +24,7 @@ class JhGetWayApplication : Application() {
     val smartRouter by lazy { SmartRouterEngine(database, providerHttpClient) }
     val gatewayServer by lazy { LocalGatewayHttpServer(database, smartRouter, preferences) }
     val workflowEngine by lazy { WorkflowEngine(database, smartRouter, mcpHttpClient) }
-    val backupManager by lazy { BackupManager(database) }
+    val backupManager by lazy { BackupManager(database, preferences) }
 
     override fun onCreate() {
         super.onCreate()

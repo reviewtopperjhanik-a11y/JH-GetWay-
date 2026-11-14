@@ -1,7 +1,7 @@
 # Privacy & Security Architecture — JH GetWay
 
 **Organization:** JH Soft Corporation  
-**Application ID:** `com.aistudio.jhgetway.rqnijj`
+**Application ID:** `com.aistudio.jhgetway.iffndf`
 
 ---
 

@@ -548,6 +548,9 @@ interface AppStrings {
     val autoFreeIncludeLocalLabel: String
     val localSectionTitle: String
     val pinnedProviderLabel: String
+    val backupNonPortableDisclosure: String
+    val backupRestoreDetailsFormat: String
 }
 
 val LocalStrings = staticCompositionLocalOf<AppStrings> { EnglishStrings }
+

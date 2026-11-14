@@ -2017,7 +2017,8 @@ class GatewayViewModel(application: Application) : AndroidViewModel(application)
 
     fun launchDownloadedApkInstall() {
         val apkFile = _appUpdateUiState.value.downloadedApkFile ?: return
-        when (val launch = AppUpdateManager.launchApkInstaller(app, apkFile)) {
+        val expectedCert = _appUpdateUiState.value.availableRelease?.expectedSigningCertSha256
+        when (val launch = AppUpdateManager.launchApkInstaller(app, apkFile, expectedCert)) {
             is ApkInstallLaunchResult.Launched -> {
                 _appUpdateUiState.update {
                     it.copy(needsInstallPermission = false, errorMessage = null, signingConflict = false)

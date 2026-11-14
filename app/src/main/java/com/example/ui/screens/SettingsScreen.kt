@@ -543,6 +543,18 @@ fun SettingsScreen(
                         modifier = Modifier.fillMaxWidth().testTag("settings_backup_passphrase_input")
                     )
                     Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        shape = MaterialTheme.shapes.small,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = s.backupNonPortableDisclosure,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.padding(8.dp)
+                        )
+                    }
+                    Surface(
                         color = MaterialTheme.colorScheme.errorContainer,
                         shape = MaterialTheme.shapes.small,
                         modifier = Modifier.fillMaxWidth()
@@ -643,6 +655,14 @@ fun SettingsScreen(
                                     text = "Format V${pv.formatVersion} • DB Schema V${pv.schemaVersion} • ${pv.kdfAlgorithm} (${pv.kdfIterations} iter)",
                                     style = MaterialTheme.typography.labelSmall
                                 )
+                                pv.manifest?.let { m ->
+                                    if (m.appVersionName.isNotBlank()) {
+                                        Text(
+                                            text = "App v${m.appVersionName} (${m.appVersionCode})",
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    }
+                                }
                                 if (pv.exportedAt > 0L) {
                                     Text("${s.exportedLabel}: ${formatTimestamp(pv.exportedAt)}", style = MaterialTheme.typography.labelSmall)
                                 }
@@ -650,13 +670,18 @@ fun SettingsScreen(
                                     Text(s.backupIntegrityVerified, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                                 }
                                 Text(
-                                    text = "Total: ${pv.counts.total} (Providers ${pv.counts.providers}, Keys ${pv.counts.apiKeys}, Models ${pv.counts.models}, Rules ${pv.counts.routingRules}, Agents ${pv.counts.codingAgents}, Local ${pv.counts.localAiServers}, MCP ${pv.counts.mcpServers}/${pv.counts.mcpTools}, Workflows ${pv.counts.workflows}, Devices ${pv.counts.devices})",
+                                    text = "Total: ${pv.counts.total} (Providers ${pv.counts.providers}, Keys ${pv.counts.apiKeys}, Models ${pv.counts.models}, Rules ${pv.counts.routingRules}, Agents ${pv.counts.codingAgents}, Local ${pv.counts.localAiServers}, MCP ${pv.counts.mcpServers}/${pv.counts.mcpTools}, Workflows ${pv.counts.workflows}/${pv.counts.workflowRuns}, Devices ${pv.counts.devices}, Chats ${pv.counts.playgroundSessions}/${pv.counts.playgroundMessages}, Metrics ${pv.counts.requestMetrics}, Prefs ${pv.counts.preferences})",
                                     style = MonoTextStyle
                                 )
                                 Text(
                                     text = "${s.backupConflictsLabel}: ${pv.conflicts.totalConflicts}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = if (pv.conflicts.totalConflicts > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = s.backupRestoreDetailsFormat,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
