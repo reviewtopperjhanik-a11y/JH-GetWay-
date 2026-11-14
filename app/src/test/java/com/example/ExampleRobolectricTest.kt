@@ -70,11 +70,15 @@ class ExampleRobolectricTest {
     fun onboardingSkip_navigatesToDashboard() {
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("onboarding_skip_all").assertIsDisplayed().performClick()
-        composeTestRule.waitUntil(timeoutMillis = 5_000) {
-            runCatching {
+        val deadlineNs = System.nanoTime() + 5_000_000_000L
+        while (System.nanoTime() < deadlineNs) {
+            val exists = runCatching {
                 composeTestRule.onNodeWithTag("dashboard_gateway_card").assertExists()
                 true
             }.getOrDefault(false)
+            if (exists) break
+            Thread.sleep(50)
+            composeTestRule.waitForIdle()
         }
         composeTestRule.onNodeWithTag("dashboard_gateway_card").assertIsDisplayed()
         composeTestRule.onNodeWithTag("bottom_nav_providers").assertIsDisplayed().performClick()

@@ -21,10 +21,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 12
 
     steps:
       - name: Checkout repository
@@ -55,21 +60,14 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      - name: Run core unit & updater tests
+      - name: Run core unit, Robolectric & updater tests
+        timeout-minutes: 10
         run: |
+          TEST_ARGS="--tests com.example.ExampleUnitTest --tests com.example.ExampleRobolectricTest --tests com.example.AppUpdateManagerTest --console=plain --no-daemon"
           if [ -x ./gradlew ]; then
-            ./gradlew :app:testDebugUnitTest --tests com.example.ExampleUnitTest --tests com.example.AppUpdateManagerTest --console=plain --no-daemon
+            ./gradlew :app:testDebugUnitTest ${TEST_ARGS}
           else
-            gradle :app:testDebugUnitTest --tests com.example.ExampleUnitTest --tests com.example.AppUpdateManagerTest --console=plain --no-daemon
-          fi
-
-      - name: Run full test suite (advisory)
-        continue-on-error: true
-        run: |
-          if [ -x ./gradlew ]; then
-            ./gradlew :app:testDebugUnitTest --console=plain --no-daemon
-          else
-            gradle :app:testDebugUnitTest --console=plain --no-daemon
+            gradle :app:testDebugUnitTest ${TEST_ARGS}
           fi
 
   build-and-release:
@@ -77,6 +75,7 @@ jobs:
     needs: test
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -164,6 +163,7 @@ jobs:
           fi
 
       - name: Build Release & Debug APKs
+        timeout-minutes: 15
         env:
           APP_VERSION_CODE: ${{ steps.version.outputs.version_code }}
           APP_VERSION_NAME: ${{ steps.version.outputs.version_name }}
@@ -243,7 +243,4 @@ jobs:
             - **Signing Mode:** `${{ steps.signing.outputs.signing_mode }}`
 
             > **Note on Seamless Updates:** To allow Android devices to update in-place without uninstalling first, configure `KEYSTORE_BASE64`, `STORE_PASSWORD`, and `KEY_PASSWORD` in your repository's **Settings -> Secrets and variables -> Actions**.
-          files: |
-            release-artifacts/${{ steps.package.outputs.release_apk }}
-            release-artifacts/JH-GetWay-${{ steps.version.outputs.release_tag }}-debug.apk
-            release-artifacts/update-manifest.json
+          files: release-artifacts/*
