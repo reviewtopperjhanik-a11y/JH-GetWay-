@@ -2,13 +2,7 @@ package com.example
 
 import com.example.updater.AppUpdateCheckResult
 import com.example.updater.AppUpdateManager
-import io.ktor.http.ContentType
-import io.ktor.server.cio.CIO
-import io.ktor.server.engine.connector
-import io.ktor.server.engine.embeddedServer
-import io.ktor.server.response.respondText
-import io.ktor.server.routing.get
-import io.ktor.server.routing.routing
+import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -18,7 +12,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import java.net.Socket
+import java.net.InetSocketAddress
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -74,68 +68,58 @@ class AppUpdateManagerTest {
 
     @Test
     fun checkForUpdate_selectsDebugOrReleaseApkAndExpectedSha256() = runBlocking {
-        var port = 0
-        val server = embeddedServer(CIO, configure = {
-            connector {
-                host = "127.0.0.1"
-                port = 0
-            }
-            reuseAddress = true
-        }) {
-            routing {
-                get("/repos/jhsoft/jh-getway/releases/latest") {
-                    call.respondText(
-                        """
-                        {
-                          "tag_name": "v1.0.5",
-                          "name": "JH GetWay v1.0.5",
-                          "body": "Fixes package update conflict",
-                          "html_url": "https://github.com/jhsoft/jh-getway/releases/tag/v1.0.5",
-                          "assets": [
-                            {
-                              "name": "JH-GetWay-v1.0.5-release.apk",
-                              "browser_download_url": "http://127.0.0.1:$port/dl/release.apk",
-                              "size": 1000
-                            },
-                            {
-                              "name": "JH-GetWay-v1.0.5-debug.apk",
-                              "browser_download_url": "http://127.0.0.1:$port/dl/debug.apk",
-                              "size": 1200
-                            },
-                            {
-                              "name": "update-manifest.json",
-                              "browser_download_url": "http://127.0.0.1:$port/dl/update-manifest.json",
-                              "size": 250
-                            }
-                          ]
-                        }
-                        """.trimIndent(),
-                        ContentType.Application.Json
-                    )
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val port = server.address.port
+        server.createContext("/repos/jhsoft/jh-getway/releases/latest") { exchange ->
+            val response = """
+                {
+                  "tag_name": "v1.0.5",
+                  "name": "JH GetWay v1.0.5",
+                  "body": "Fixes package update conflict",
+                  "html_url": "https://github.com/jhsoft/jh-getway/releases/tag/v1.0.5",
+                  "assets": [
+                    {
+                      "name": "JH-GetWay-v1.0.5-release.apk",
+                      "browser_download_url": "http://127.0.0.1:$port/dl/release.apk",
+                      "size": 1000
+                    },
+                    {
+                      "name": "JH-GetWay-v1.0.5-debug.apk",
+                      "browser_download_url": "http://127.0.0.1:$port/dl/debug.apk",
+                      "size": 1200
+                    },
+                    {
+                      "name": "update-manifest.json",
+                      "browser_download_url": "http://127.0.0.1:$port/dl/update-manifest.json",
+                      "size": 250
+                    }
+                  ]
                 }
-                get("/dl/update-manifest.json") {
-                    call.respondText(
-                        """
-                        {
-                          "versionCode": 105,
-                          "versionName": "1.0.5",
-                          "tag": "v1.0.5",
-                          "apkName": "JH-GetWay-v1.0.5-release.apk",
-                          "sha256": "relsha256",
-                          "debugApkName": "JH-GetWay-v1.0.5-debug.apk",
-                          "debugSha256": "dbgsha256",
-                          "signingMode": "ci-ephemeral"
-                        }
-                        """.trimIndent(),
-                        ContentType.Application.Json
-                    )
-                }
-            }
+            """.trimIndent().toByteArray()
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.sendResponseHeaders(200, response.size.toLong())
+            exchange.responseBody.use { it.write(response) }
         }
-        server.start(wait = false)
+        server.createContext("/dl/update-manifest.json") { exchange ->
+            val response = """
+                {
+                  "versionCode": 105,
+                  "versionName": "1.0.5",
+                  "tag": "v1.0.5",
+                  "apkName": "JH-GetWay-v1.0.5-release.apk",
+                  "sha256": "relsha256",
+                  "debugApkName": "JH-GetWay-v1.0.5-debug.apk",
+                  "debugSha256": "dbgsha256",
+                  "signingMode": "ci-ephemeral"
+                }
+            """.trimIndent().toByteArray()
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.sendResponseHeaders(200, response.size.toLong())
+            exchange.responseBody.use { it.write(response) }
+        }
+
+        server.start()
         try {
-            port = server.engine.resolvedConnectors().first().port
-            Socket("127.0.0.1", port).use { }
             val base = "http://127.0.0.1:$port"
             val rawDbgRes = AppUpdateManager.checkForUpdate(
                 repoInput = "jhsoft/jh-getway",
@@ -163,7 +147,7 @@ class AppUpdateManagerTest {
             assertEquals("relsha256", relRes.release.expectedSha256)
             assertEquals("ci-ephemeral", relRes.release.signingMode)
         } finally {
-            runCatching { server.stop(100, 300) }
+            server.stop(0)
         }
     }
 }
