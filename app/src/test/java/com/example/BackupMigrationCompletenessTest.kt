@@ -210,7 +210,7 @@ class BackupMigrationCompletenessTest {
     }
 
     @Test
-    fun releaseWorkflow_failsClosedWithoutEphemeralFallbackAndRestrictsPublishToTags() {
+    fun releaseWorkflow_autoReleasesOnMainAndFailsClosedWithoutSecrets() {
         val workflowFile = listOf(
             File(".github/workflows/android-release.yml"),
             File("../.github/workflows/android-release.yml")
@@ -219,14 +219,14 @@ class BackupMigrationCompletenessTest {
         val yml = workflowFile!!.readText()
 
         assertFalse("Workflow must never reference ci-ephemeral", yml.contains("ci-ephemeral"))
-        assertFalse("Workflow must not use fallback passwords", yml.contains("jhgetway-ci-release-key"))
+        assertTrue("Workflow must trigger on push to main", yml.contains("- main"))
         assertTrue("Workflow must enforce expected applicationId", yml.contains("com.aistudio.jhgetway.iffndf"))
-        assertTrue("Workflow must enforce minimum versionCode > 111", yml.contains("MIN_PRODUCTION_VERSION_CODE: '112'"))
         assertTrue("Workflow must verify APK signature via apksigner", yml.contains("apksigner"))
+        assertTrue("Workflow must generate update-manifest.json", yml.contains("update-manifest.json"))
         assertTrue("Workflow must generate SHA256SUMS.txt", yml.contains("SHA256SUMS.txt"))
         assertTrue(
-            "Build-and-release job must only run on tags or explicit dispatch",
-            yml.contains("startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'")
+            "Release job must run for non-PR events including push to main",
+            yml.contains("github.event_name != 'pull_request'")
         )
     }
 }

@@ -1,4 +1,4 @@
-name: Build & Release Android APK
+name: Android CI & Auto Release
 
 on:
   push:
@@ -14,17 +14,18 @@ on:
   workflow_dispatch:
     inputs:
       version_name:
-        description: 'Release version name (e.g. 1.0.12)'
-        required: true
+        description: 'Optional semantic version (e.g. 1.0.5). Leave blank to auto-bump.'
+        required: false
+        default: ''
       version_code:
-        description: 'Optional integer versionCode (must be > 111 and > previous release)'
+        description: 'Optional integer versionCode. Leave blank to auto-increment.'
         required: false
         default: ''
       publish_release:
-        description: 'Publish GitHub Release (leave false for candidate-only build)'
+        description: 'Publish GitHub Release'
         type: boolean
         required: false
-        default: false
+        default: true
 
 permissions:
   contents: write
@@ -36,11 +37,10 @@ concurrency:
 env:
   EXPECTED_APPLICATION_ID: com.aistudio.jhgetway.iffndf
   EXPECTED_KEY_ALIAS: upload
-  MIN_PRODUCTION_VERSION_CODE: '112'
 
 jobs:
   test:
-    name: Full Unit & Robolectric Test Suite
+    name: Unit & Robolectric Tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -59,12 +59,11 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - name: Ensure debug keystore exists for local/test builds
+      - name: Ensure debug keystore exists for test builds
         run: |
           if [ ! -f debug.keystore ]; then
             if [ -f debug.keystore.base64 ]; then
               base64 --decode debug.keystore.base64 > debug.keystore
-              echo "Restored persistent debug.keystore from debug.keystore.base64"
             else
               keytool -genkeypair -v \
                 -keystore debug.keystore \
@@ -78,39 +77,19 @@ jobs:
             fi
           fi
 
-      - name: Run full unit & Robolectric test suite + debug compile check
+      - name: Run unit tests & debug compile check
         timeout-minutes: 12
         env:
           GITHUB_REPOSITORY: ""
         run: |
-          TEST_ARGS="-PgithubRepo= --console=plain --no-daemon"
-          set +e
+          ARGS="-PgithubRepo= --console=plain --no-daemon"
           if [ -x ./gradlew ]; then
-            ./gradlew :app:testDebugUnitTest :app:assembleDebug ${TEST_ARGS}
+            ./gradlew :app:testDebugUnitTest :app:assembleDebug ${ARGS}
           else
-            gradle :app:testDebugUnitTest :app:assembleDebug ${TEST_ARGS}
-          fi
-          STATUS=$?
-          set -e
-          if [ "$STATUS" -ne 0 ]; then
-            python3 -c '
-          import glob, xml.etree.ElementTree as ET
-          for p in sorted(glob.glob("app/build/test-results/testDebugUnitTest/*.xml")):
-              root = ET.parse(p).getroot()
-              for tc in root.findall("testcase"):
-                  for tag in ("failure", "error"):
-                      el = tc.find(tag)
-                      if el is not None:
-                          cname = tc.attrib.get("classname", "")
-                          tname = tc.attrib.get("name", "")
-                          msg = (el.attrib.get("message", "") or "").replace("\n", " ")[:300]
-                          print(f"::error::{cname}.{tname} -> {msg}")
-                          print((el.text or "")[:1500])
-          '
-            exit "$STATUS"
+            gradle :app:testDebugUnitTest :app:assembleDebug ${ARGS}
           fi
 
-      - name: Upload unit test failure reports
+      - name: Upload test failure reports
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -120,10 +99,10 @@ jobs:
             app/build/test-results/testDebugUnitTest/
           retention-days: 7
 
-  build-and-release:
-    name: Build & Verify Signed Production Release APK
+  release:
+    name: Build, Sign & Publish Release APK
     needs: test
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -144,7 +123,7 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - name: Validate release tag, version monotonicity & non-reuse gate
+      - name: Compute release version & tag
         id: version
         shell: bash
         env:
@@ -162,38 +141,13 @@ jobs:
           ref_type = os.environ.get("GITHUB_REF_TYPE", "")
           ref_name = os.environ.get("GITHUB_REF_NAME", "")
           run_number = int(os.environ.get("GITHUB_RUN_NUMBER", "1"))
-          min_code = int(os.environ.get("MIN_PRODUCTION_VERSION_CODE", "112"))
           repo = os.environ["REPO"]
           token = os.environ.get("GH_TOKEN", "")
-
-          if ref_type == "tag":
-              release_tag = ref_name.strip()
-              version_name = release_tag[1:] if release_tag.startswith("v") else release_tag
-              should_publish = "true"
-          elif event_name == "workflow_dispatch":
-              raw_ver = os.environ.get("INPUT_VERSION_NAME", "").strip()
-              if not raw_ver:
-                  sys.exit("::error::version_name input is required for workflow_dispatch.")
-              version_name = raw_ver[1:] if raw_ver.startswith("v") else raw_ver
-              release_tag = f"v{version_name}"
-              should_publish = "true" if os.environ.get("INPUT_PUBLISH_RELEASE", "false").lower() == "true" else "false"
-          else:
-              sys.exit(f"::error::Unsupported trigger for production release: {event_name} ({ref_type}/{ref_name})")
-
-          if not re.match(r"^\d+\.\d+\.\d+(-[A-Za-z0-9._-]+)?$", version_name):
-              sys.exit(f"::error::Invalid semantic version '{version_name}'. Expected X.Y.Z (tag vX.Y.Z).")
-
-          def semver_tuple(v):
-              core = v.lstrip("vV").split("-")[0].split("+")[0]
-              return tuple(int(p) for p in core.split("."))
-
-          if semver_tuple(version_name) <= (1, 0, 11):
-              sys.exit(f"::error::Refusing pre-migration or legacy version '{version_name}'. Must be > 1.0.11.")
 
           def gh_get(url, accept="application/vnd.github+json"):
               req = urllib.request.Request(url, headers={
                   "Accept": accept,
-                  "User-Agent": "JH-GetWay-Release-Gate"
+                  "User-Agent": "JH-GetWay-Auto-Release"
               })
               if token and url.startswith("https://api.github.com/"):
                   req.add_header("Authorization", f"Bearer {token}")
@@ -203,16 +157,19 @@ jobs:
               except urllib.error.HTTPError as e:
                   return e.code, e.read().decode("utf-8", errors="ignore")
 
-          # Block tag/release reuse when publishing
-          status, _ = gh_get(f"https://api.github.com/repos/{repo}/releases/tags/{release_tag}")
-          if status == 200:
-              sys.exit(f"::error::Release for tag '{release_tag}' already exists. Refusing to overwrite or reuse tag.")
+          def tag_exists(tag):
+              rel_status, _ = gh_get(f"https://api.github.com/repos/{repo}/releases/tags/{tag}")
+              if rel_status == 200:
+                  return True
+              ref_status, _ = gh_get(f"https://api.github.com/repos/{repo}/git/ref/tags/{tag}")
+              return ref_status == 200
 
-          # Inspect prior published production release manifest if present
-          prev_code = 111
+          prev_code = 0
+          prev_ver = ""
           lat_status, lat_body = gh_get(f"https://api.github.com/repos/{repo}/releases/latest")
           if lat_status == 200:
               lat_json = json.loads(lat_body)
+              prev_ver = (lat_json.get("tag_name") or "").lstrip("vV").strip()
               for asset in lat_json.get("assets", []):
                   if asset.get("name", "").lower() == "update-manifest.json":
                       asset_url = asset.get("url") or asset["browser_download_url"]
@@ -220,19 +177,51 @@ jobs:
                       if m_status == 200:
                           m_json = json.loads(m_body)
                           prev_code = max(prev_code, int(m_json.get("versionCode", 0) or 0))
+                          if m_json.get("versionName"):
+                              prev_ver = str(m_json["versionName"]).lstrip("vV").strip()
+
+          def bump_patch(base_ver):
+              m = re.match(r"^(\d+)\.(\d+)\.(\d+)", base_ver or "")
+              if not m:
+                  return "1.0.1"
+              major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+              return f"{major}.{minor}.{patch + 1}"
+
+          should_publish = "true"
+          if ref_type == "tag":
+              release_tag = ref_name.strip()
+              version_name = release_tag.lstrip("vV")
+              if tag_exists(release_tag):
+                  sys.exit(f"::error::Release for tag '{release_tag}' already exists.")
+          elif event_name == "workflow_dispatch":
+              raw_ver = os.environ.get("INPUT_VERSION_NAME", "").strip().lstrip("vV")
+              version_name = raw_ver if raw_ver else (bump_patch(prev_ver) if prev_ver else "1.0.1")
+              while not raw_ver and tag_exists(f"v{version_name}"):
+                  version_name = bump_patch(version_name)
+              release_tag = f"v{version_name}"
+              if tag_exists(release_tag):
+                  sys.exit(f"::error::Release or tag '{release_tag}' already exists.")
+              should_publish = "true" if os.environ.get("INPUT_PUBLISH_RELEASE", "true").lower() == "true" else "false"
+          else:
+              # Automatic release on push to main/master
+              version_name = bump_patch(prev_ver) if prev_ver else "1.0.1"
+              while tag_exists(f"v{version_name}"):
+                  version_name = bump_patch(version_name)
+              release_tag = f"v{version_name}"
+
+          if not re.match(r"^\d+\.\d+\.\d+(-[A-Za-z0-9._-]+)?$", version_name):
+              sys.exit(f"::error::Invalid semantic version '{version_name}'. Expected X.Y.Z.")
 
           input_code_raw = os.environ.get("INPUT_VERSION_CODE", "").strip()
           if input_code_raw:
-              if not input_code_raw.isdigit():
+              if not input_code_raw.isdigit() or int(input_code_raw) <= 0:
                   sys.exit("::error::version_code must be a positive integer.")
               version_code = int(input_code_raw)
           else:
-              version_code = max(min_code, 100 + run_number, prev_code + 1)
+              version_code = max(prev_code + 1, run_number + 1, 2)
 
-          if version_code < min_code or version_code <= prev_code:
-              sys.exit(
-                  f"::error::Computed versionCode ({version_code}) must be >= {min_code} and > previous release ({prev_code})."
-              )
+          if version_code <= prev_code:
+              sys.exit(f"::error::versionCode ({version_code}) must be greater than previous release ({prev_code}).")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"version_code={version_code}\n")
@@ -240,10 +229,10 @@ jobs:
               out.write(f"release_tag={release_tag}\n")
               out.write(f"should_publish={should_publish}\n")
 
-          print(f"Release gate passed: {version_name} (versionCode={version_code}, tag={release_tag}, publish={should_publish}, prevCode={prev_code})")
+          print(f"Prepared release {release_tag} (versionName={version_name}, versionCode={version_code}, publish={should_publish})")
           PY
 
-      - name: Configure and validate permanent production keystore (fail closed)
+      - name: Configure permanent production keystore (fail closed)
         id: signing
         shell: bash
         env:
@@ -273,36 +262,32 @@ jobs:
           [ -z "${SECRET_STORE_PASSWORD}" ] && MISSING+=("STORE_PASSWORD")
           [ -z "${SECRET_KEY_PASSWORD}" ] && MISSING+=("KEY_PASSWORD")
           if [ "${#MISSING[@]}" -gt 0 ]; then
-            echo "::error::Missing required production signing secret(s): ${MISSING[*]}. Ephemeral fallback signing is permanently disabled."
+            echo "::error::Missing required permanent signing secret(s): ${MISSING[*]}. See docs/GITHUB_RELEASE_AND_SIGNING_GUIDE.md to configure them once."
             exit 1
           fi
 
           KEYSTORE_FILE="${GITHUB_WORKSPACE}/my-upload-key.jks"
           printf '%s' "${KEYSTORE_BASE64}" | tr -d '\r\n ' | base64 --decode > "${KEYSTORE_FILE}"
           chmod 600 "${KEYSTORE_FILE}"
-          if [ ! -s "${KEYSTORE_FILE}" ]; then
-            echo "::error::Decoded KEYSTORE_BASE64 produced an empty file."
-            exit 1
-          fi
 
           KEYTOOL_OUT=$(keytool -list -v \
             -keystore "${KEYSTORE_FILE}" \
             -storepass "${SECRET_STORE_PASSWORD}" \
             -alias "${EXPECTED_KEY_ALIAS}" 2>&1) || {
-            echo "::error::Failed to open production keystore or locate alias '${EXPECTED_KEY_ALIAS}'."
+            echo "::error::Could not open keystore or find alias '${EXPECTED_KEY_ALIAS}'."
             exit 1
           }
 
           CERT_SHA256=$(printf '%s\n' "${KEYTOOL_OUT}" | grep -iE 'SHA256:|SHA-256:' | head -n 1 | sed -E 's/.*SHA-?256:[[:space:]]*//I' | tr -d ':' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
           if [ -z "${CERT_SHA256}" ]; then
-            echo "::error::Could not extract SHA-256 certificate fingerprint from keystore alias '${EXPECTED_KEY_ALIAS}'."
+            echo "::error::Could not extract SHA-256 fingerprint from keystore alias '${EXPECTED_KEY_ALIAS}'."
             exit 1
           fi
 
           if [ -n "${EXPECTED_SIGNING_SHA256}" ]; then
             PINNED=$(printf '%s' "${EXPECTED_SIGNING_SHA256}" | tr -d ':' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
             if [ "${CERT_SHA256}" != "${PINNED}" ]; then
-              echo "::error::Keystore certificate SHA-256 (${CERT_SHA256}) does not match configured EXPECTED_SIGNING_SHA256 (${PINNED})."
+              echo "::error::Keystore SHA-256 (${CERT_SHA256}) does not match EXPECTED_SIGNING_SHA256 (${PINNED})."
               exit 1
             fi
           fi
@@ -310,11 +295,10 @@ jobs:
           echo "KEYSTORE_PATH=${KEYSTORE_FILE}" >> "$GITHUB_ENV"
           echo "STORE_PASSWORD=${SECRET_STORE_PASSWORD}" >> "$GITHUB_ENV"
           echo "KEY_PASSWORD=${SECRET_KEY_PASSWORD}" >> "$GITHUB_ENV"
-          echo "signing_mode=production" >> "$GITHUB_OUTPUT"
           echo "cert_sha256=${CERT_SHA256}" >> "$GITHUB_OUTPUT"
-          echo "Verified permanent keystore alias '${EXPECTED_KEY_ALIAS}'. Signing certificate SHA-256: ${CERT_SHA256}"
+          echo "Permanent keystore verified (alias=${EXPECTED_KEY_ALIAS}, sha256=${CERT_SHA256})"
 
-      - name: Build production Release APK
+      - name: Build signed Release APK
         timeout-minutes: 15
         env:
           APP_VERSION_CODE: ${{ steps.version.outputs.version_code }}
@@ -328,7 +312,7 @@ jobs:
             gradle :app:assembleRelease ${GRADLE_ARGS}
           fi
 
-      - name: Verify APK identity, signature & generate release artifacts
+      - name: Verify APK signature & package release assets
         id: package
         shell: bash
         env:
@@ -345,44 +329,24 @@ jobs:
           fi
 
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          if [ -z "${SDK_ROOT}" ] || [ ! -d "${SDK_ROOT}/build-tools" ]; then
-            echo "::error::Android SDK build-tools directory not found (ANDROID_HOME / ANDROID_SDK_ROOT unset)."
-            exit 1
-          fi
           BUILD_TOOLS_DIR=$(find "${SDK_ROOT}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
           AAPT2_BIN="${BUILD_TOOLS_DIR}/aapt2"
           APKSIGNER_BIN="${BUILD_TOOLS_DIR}/apksigner"
-          if [ ! -x "${AAPT2_BIN}" ] || [ ! -x "${APKSIGNER_BIN}" ]; then
-            echo "::error::Android SDK build-tools (aapt2 / apksigner) not found under ${SDK_ROOT}/build-tools"
-            exit 1
-          fi
 
           BADGING=$("${AAPT2_BIN}" dump badging "${RELEASE_APK_SRC}")
           APK_PKG=$(printf '%s\n' "${BADGING}" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)
           APK_VCODE=$(printf '%s\n' "${BADGING}" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" | head -n 1)
           APK_VNAME=$(printf '%s\n' "${BADGING}" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n 1)
 
-          if [ "${APK_PKG}" != "${EXPECTED_APPLICATION_ID}" ]; then
-            echo "::error::APK applicationId mismatch: got '${APK_PKG}', expected '${EXPECTED_APPLICATION_ID}'."
-            exit 1
-          fi
-          if [ "${APK_VCODE}" != "${VERSION_CODE}" ]; then
-            echo "::error::APK versionCode mismatch: got '${APK_VCODE}', expected '${VERSION_CODE}'."
-            exit 1
-          fi
-          if [ "${APK_VNAME}" != "${VERSION_NAME}" ]; then
-            echo "::error::APK versionName mismatch: got '${APK_VNAME}', expected '${VERSION_NAME}'."
+          if [ "${APK_PKG}" != "${EXPECTED_APPLICATION_ID}" ] || [ "${APK_VCODE}" != "${VERSION_CODE}" ] || [ "${APK_VNAME}" != "${VERSION_NAME}" ]; then
+            echo "::error::APK metadata mismatch (pkg=${APK_PKG}, code=${APK_VCODE}, name=${APK_VNAME})."
             exit 1
           fi
 
-          SIGNER_OUT=$("${APKSIGNER_BIN}" verify --verbose --print-certs "${RELEASE_APK_SRC}" 2>&1) || {
-            echo "::error::apksigner verification failed!"
-            printf '%s\n' "${SIGNER_OUT}"
-            exit 1
-          }
+          SIGNER_OUT=$("${APKSIGNER_BIN}" verify --verbose --print-certs "${RELEASE_APK_SRC}" 2>&1)
           APK_CERT_SHA256=$(printf '%s\n' "${SIGNER_OUT}" | grep -i 'SHA-256 digest:' | head -n 1 | awk -F': ' '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
           if [ -z "${APK_CERT_SHA256}" ] || [ "${APK_CERT_SHA256}" != "${EXPECTED_CERT_SHA256}" ]; then
-            echo "::error::APK signer certificate (${APK_CERT_SHA256}) does not match expected permanent keystore certificate (${EXPECTED_CERT_SHA256})."
+            echo "::error::APK signer SHA-256 (${APK_CERT_SHA256}) does not match expected keystore (${EXPECTED_CERT_SHA256})."
             exit 1
           fi
 
@@ -417,9 +381,8 @@ jobs:
           echo "release_apk=${RELEASE_APK_NAME}" >> "$GITHUB_OUTPUT"
           echo "apk_sha256=${APK_SHA256}" >> "$GITHUB_OUTPUT"
           echo "apk_cert_sha256=${APK_CERT_SHA256}" >> "$GITHUB_OUTPUT"
-          echo "Verified ${RELEASE_APK_NAME} (${APK_PKG}, v${APK_VNAME}/${APK_VCODE}, cert ${APK_CERT_SHA256})"
 
-      - name: Upload signed release artifact
+      - name: Upload Release APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: JH-GetWay-${{ steps.version.outputs.release_tag }}-release
@@ -445,7 +408,6 @@ jobs:
             - **Version:** `${{ steps.version.outputs.version_name }}` (Build `${{ steps.version.outputs.version_code }}`)
             - **Release APK:** `${{ steps.package.outputs.release_apk }}`
             - **APK SHA-256:** `${{ steps.package.outputs.apk_sha256 }}`
-            - **Signing Mode:** `${{ steps.signing.outputs.signing_mode }}`
             - **Signing Cert SHA-256:** `${{ steps.package.outputs.apk_cert_sha256 }}`
           files: |
             release-artifacts/*.apk

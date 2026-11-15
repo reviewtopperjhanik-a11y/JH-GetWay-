@@ -205,5 +205,6 @@ class PhaseFUiAndReleaseTest {
         assertTrue(File(rootDir, "README.md").exists())
         assertTrue(File(rootDir, "docs/PRIVACY_AND_SECURITY.md").exists())
         assertTrue(File(rootDir, "docs/DEPENDENCY_LICENSES.md").exists())
+        assertTrue(File(rootDir, "docs/GITHUB_RELEASE_AND_SIGNING_GUIDE.md").exists())
     }
 }

@@ -61,16 +61,11 @@ gradle :app:compileDebugKotlin
 gradle :app:testDebugUnitTest --console=plain
 ```
 
-### Tag-Based Production GitHub Releases (Fail-Closed Signing)
-- Pushes and pull requests on `main`/`master` run the complete unit & Robolectric test suite (`:app:testDebugUnitTest` and `:app:assembleDebug`) **without** publishing releases.
-- Explicit version tags (`v*`, e.g., `v1.0.12`) trigger `.github/workflows/android-release.yml`, which:
-  1. Runs the complete test suite (`:app:testDebugUnitTest`).
-  2. Verifies tag format, prevents tag reuse, and enforces `versionCode > 111` (and strictly greater than prior published releases).
-  3. Fails closed unless permanent signing secrets (`KEYSTORE_BASE64`, `STORE_PASSWORD`, `KEY_PASSWORD`) are configured for key alias `upload` in **GitHub -> Settings -> Secrets and variables -> Actions** (optional `EXPECTED_SIGNING_SHA256` variable pins the exact certificate fingerprint).
-  4. Builds `:app:assembleRelease`, verifies package ID (`com.aistudio.jhgetway.iffndf`), `versionCode`, and signer certificate with `aapt2` and `apksigner`.
-  5. Publishes `JH-GetWay-v*-release.apk`, `update-manifest.json`, and `SHA256SUMS.txt` (never debug APKs).
-
-### Mobile In-App Updates
-APKs built by the GitHub workflow automatically know their repository slug (`BuildConfig.GITHUB_REPO`) and check GitHub Releases on launch (or manually via **Settings -> App Updates (GitHub Releases)**), download the new APK with SHA-256 verification, and launch the Android package installer.
+### GitHub Auto-Releases & Permanent Signing
+- Every push to `main`/`master` runs `.github/workflows/android-release.yml`:
+  1. **Test job:** Runs `:app:testDebugUnitTest` and `:app:assembleDebug` (PRs run tests only without publishing).
+  2. **Release job:** Auto-increments semantic `versionName` and `versionCode` from the latest release, signs `:app:assembleRelease` using fail-closed permanent GitHub Secrets (`KEYSTORE_BASE64`, `STORE_PASSWORD`, `KEY_PASSWORD` for alias `upload`), verifies `applicationId` + signer certificate via `aapt2`/`apksigner`, and publishes `JH-GetWay-v*-release.apk`, `update-manifest.json`, and `SHA256SUMS.txt` to GitHub Releases.
+- In-app updater (`AppUpdateManager`) verifies `packageId`, `SHA-256`, and signing certificate before launching Android's in-place update installer so future updates install without uninstalling.
+- Full setup & permanent keystore instructions (Bengali + English): [`docs/GITHUB_RELEASE_AND_SIGNING_GUIDE.md`](docs/GITHUB_RELEASE_AND_SIGNING_GUIDE.md).
 
 For privacy details see [`docs/PRIVACY_AND_SECURITY.md`](docs/PRIVACY_AND_SECURITY.md). For third-party library licenses see [`docs/DEPENDENCY_LICENSES.md`](docs/DEPENDENCY_LICENSES.md).
